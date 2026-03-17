@@ -38,6 +38,17 @@ async def health():
     return {"status": "ok", "service": "cerebro"}
 
 
+@router.get("/status", response_model=ApiResponse, summary="Estado actual del Orquestador")
+async def get_status():
+    """
+    Retorna el estado actual, incluido el proyecto activo.
+    """
+    return ApiResponse(ok=True, message="Estado obtenido", data={
+        "active_project": orchestrator.active_project,
+        "workspace_root": orchestrator.workspace_root
+    })
+
+
 @router.post("/bootstrap", response_model=ApiResponse, summary="Iniciar proceso de seleccion de proyecto")
 async def bootstrap():
     """

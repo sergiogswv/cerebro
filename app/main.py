@@ -32,8 +32,35 @@ async def lifespan(app: FastAPI):
     async def delayed_bootstrap():
         await asyncio.sleep(5)
         await orchestrator.bootstrap()
+
+    # Tarea de telemetría para el Dashboard
+    async def telemetry_task():
+        import psutil
+        from app.sockets import sio
+        import time
+        start_time = time.time()
+        while True:
+            try:
+                cpu = psutil.cpu_percent(interval=None)
+                ram = psutil.virtual_memory().percent
+                uptime_seconds = int(time.time() - start_time)
+                
+                # Formatear Uptime (HH:MM:SS)
+                m, s = divmod(uptime_seconds, 60)
+                h, m = divmod(m, 60)
+                uptime_str = f"{h:02d}:{m:02d}:{s:02d}"
+
+                await sio.emit('system_stats', {
+                    "cpu": f"{cpu}%",
+                    "ram": f"{ram}%",
+                    "uptime": uptime_str
+                })
+            except Exception as e:
+                logger.error(f"Error en telemetría: {e}")
+            await asyncio.sleep(3)
         
     asyncio.create_task(delayed_bootstrap())
+    asyncio.create_task(telemetry_task())
     
     yield
     logger.info("🧠 Cerebro apagado")

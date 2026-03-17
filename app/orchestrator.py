@@ -195,7 +195,7 @@ class Orchestrator:
         await emit_system_status({"type": "project_selected", "project": project_name})
         
         # Arrancar Sentinel automaticamente para ese proyecto
-        project_path = os.path.join(self.workspace_root, project_name)
+        project_path = os.path.join(self.workspace_root, project_name).replace("\\", "/")
         
         await send_command(
             "sentinel",
