@@ -210,6 +210,196 @@ class Orchestrator:
         
         return {"status": "ok", "project": project_name}
 
+    async def get_architect_config(self) -> dict:
+        """Lee el archivo architect.json del proyecto activo"""
+        if not self.active_project:
+            return {"error": "No hay proyecto activo seleccionado"}
+        
+        config_path = os.path.join(self.workspace_root, self.active_project, "architect.json")
+        if not os.path.exists(config_path):
+            # Retornar una estructura básica si no existe
+            return {
+                "version": "1.0",
+                "rules": [],
+                "exclude": ["**/node_modules/**"]
+            }
+            
+        import json
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error leyendo architect.json: {e}")
+            return {"error": str(e)}
+
+    async def save_architect_config(self, config: dict) -> dict:
+        """Guarda el archivo architect.json en el proyecto activo"""
+        if not self.active_project:
+            return {"error": "No hay proyecto activo seleccionado"}
+            
+        config_path = os.path.join(self.workspace_root, self.active_project, "architect.json")
+        import json
+        try:
+            # Validar que sea un JSON válido antes de guardar (ya es dict, pero por si acaso)
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"✅ architect.json actualizado para {self.active_project}")
+            
+            # Notificar al dashboard y potencialmente a Architect (si tuviera reload)
+            from app.sockets import emit_agent_event
+            await emit_agent_event({
+                "source": "architect",
+                "type": "config_updated",
+                "severity": "info",
+                "payload": {"message": "Configuración de arquitectura actualizada desde Skrymir"}
+            })
+            
+            return {"status": "ok"}
+        except Exception as e:
+            logger.error(f"Error guardando architect.json: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def architect_init(self, pattern: str | None = None) -> dict:
+        """Llama al ejecutor para correr el comando 'init' de Architect en el proyecto activo"""
+        if not self.active_project:
+            return {"error": "No hay proyecto activo seleccionado"}
+            
+        project_path = os.path.join(self.workspace_root, self.active_project).replace("\\", "/")
+        
+        # LOG de inicio
+        from app.sockets import emit_agent_event
+        await emit_agent_event({
+            "source": "architect",
+            "type": "init_started",
+            "severity": "info",
+            "payload": {"message": f"Iniciando Magia ({pattern or 'Default'}) en {self.active_project}... Esto tomará unos segundos."}
+        })
+
+        # Enviamos acción 'run' para ejecución one-shot y esperamos
+        # El ejecutor ahora usará asyncio.to_thread para no bloquear
+        options = {
+            "init": True,
+            "force": True
+        }
+        if pattern:
+            options["pattern"] = pattern
+
+        ack = await send_command(
+            "ejecutor", # Enviamos al ejecutor directamente
+            OrchestratorCommand(
+                action="run",
+                service="architect",
+                target=project_path,
+                options=options
+            )
+        )
+        
+        # Si el comando terminó OK, avisamos al dashboard para que recargue
+        await emit_agent_event({
+            "source": "architect",
+            "type": "init_completed",
+            "severity": "info",
+            "payload": {"message": "¡Magia completada! Arquitectura base generada exitosamente."}
+        })
+        
+        return {"status": "ok", "ack": ack}
+    async def get_architect_patterns(self) -> list:
+        """Retorna los patrones disponibles para el framework detectado en el proyecto activo"""
+        if not self.active_project:
+            return []
+        project_path = os.path.join(self.workspace_root, self.active_project)
+        
+        # Usamos el detector de Architect para saber el framework
+        from app.dispatcher import AGENT_URLS
+        import httpx
+        try:
+            # Una forma rápida es preguntar al detector (o re-implementarlo aquí)
+            # Por ahora, devolvemos una lista genérica premium si es NestJS
+            if os.path.exists(os.path.join(project_path, "nest-cli.json")):
+                return [
+                    {"id": "hexagonal", "label": "Hexagonal", "description": "domain/ application/ infrastructure/"},
+                    {"id": "clean", "label": "Clean Architecture", "description": "entities/ use-cases/ adapters/"},
+                    {"id": "layered", "label": "Layered", "description": "controllers/ services/ repos/"}
+                ]
+            return [
+                {"id": "mvc", "label": "MVC", "description": "Classic Model-View-Controller"},
+                {"id": "hexagonal", "label": "Hexagonal", "description": "Domain-driven design"}
+            ]
+        except:
+            return []
+
+    async def get_ai_config(self) -> dict:
+        """Carga .architect.ai.json del proyecto activo"""
+        if not self.active_project:
+            return {}
+        path = os.path.join(self.workspace_root, self.active_project, ".architect.ai.json")
+        if not os.path.exists(path):
+            return {"configs": [], "selected_name": ""}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                import json
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error cargando AI config: {e}")
+            return {"error": str(e)}
+
+    async def save_ai_config(self, config: dict) -> dict:
+        """Guarda .architect.ai.json en el proyecto activo"""
+        if not self.active_project:
+            return {"error": "No hay proyecto activo"}
+        path = os.path.join(self.workspace_root, self.active_project, ".architect.ai.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                import json
+                json.dump(config, f, indent=2)
+            return {"status": "success"}
+        except Exception as e:
+            logger.error(f"Error guardando AI config: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def validate_ai_provider(self, url: str, key: str, provider: str) -> dict:
+        """Intenta listar modelos del proveedor para validar URL y API Key"""
+        import httpx
+        
+        # Normalizar URL (OpenAI/Claude suelen tener /v1/models o similar)
+        endpoint = url.rstrip("/")
+        if "ollama" in provider.lower():
+            endpoint = f"{endpoint}/api/tags"
+        elif "claude" in provider.lower() or "anthropic" in provider.lower():
+            # Anthropic no tiene un endpoint de 'models' tan simple como OpenAI, 
+            # pero para validar solemos probar un request vacío o usar su metadata.
+            # Por simplicidad en este prototipo, usamos el estándar OpenAI si la URL lo parece.
+            if "/v1" not in endpoint: endpoint = f"{endpoint}/v1/models"
+            else: endpoint = f"{endpoint}/models"
+        else:
+            if "/v1" not in endpoint: endpoint = f"{endpoint}/v1/models"
+            else: endpoint = f"{endpoint}/models"
+
+        headers = {}
+        if "ollama" not in provider.lower():
+            headers["Authorization"] = f"Bearer {key}"
+            if "claude" in provider.lower():
+                headers["x-api-key"] = key
+                headers["anthropic-version"] = "2023-06-01"
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(endpoint, headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    models = []
+                    # Extraer modelos según formato
+                    if "models" in data: # Ollama
+                        models = [m["name"] for m in data["models"]]
+                    elif "data" in data: # OpenAI
+                        models = [m["id"] for m in data["data"]]
+                    return {"ok": True, "models": models}
+                else:
+                    return {"ok": False, "error": f"Error {resp.status_code}: {resp.text}"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
 
 # Instancia global del orquestador
 orchestrator = Orchestrator()

@@ -43,6 +43,7 @@ class AgentEvent(BaseModel):
 
 class OrchestratorCommand(BaseModel):
     action: str
+    service: str | None = None  # Requerido para action="run"
     target: str | None = None
     options: dict[str, Any] = Field(default_factory=dict)
     request_id: str = Field(default_factory=lambda: str(uuid.uuid4()))

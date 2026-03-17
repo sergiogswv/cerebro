@@ -103,3 +103,64 @@ async def interaction_response(request: Request):
     )
 
     return ApiResponse(ok=True, message="Respuesta de interacción enviada")
+
+
+@router.get("/architect/config", response_model=ApiResponse, summary="Obtener config de Architect del proyecto activo")
+async def get_architect_config():
+    result = await orchestrator.get_architect_config()
+    if isinstance(result, dict) and "error" in result:
+        return ApiResponse(ok=False, message=result["error"])
+    return ApiResponse(ok=True, data=result)
+
+
+@router.post("/architect/config", response_model=ApiResponse, summary="Guardar config de Architect del proyecto activo")
+async def save_architect_config(request: Request):
+    config = await request.json()
+    result = await orchestrator.save_architect_config(config)
+    if result.get("status") == "error":
+        return ApiResponse(ok=False, message=result.get("message"))
+    return ApiResponse(ok=True, message="Configuración guardada exitosamente")
+
+
+@router.get("/architect/patterns", response_model=ApiResponse)
+async def get_architect_patterns():
+    patterns = await orchestrator.get_architect_patterns()
+    return ApiResponse(ok=True, data=patterns)
+
+
+@router.get("/architect/ai-config", response_model=ApiResponse)
+async def get_ai_config():
+    config = await orchestrator.get_ai_config()
+    return ApiResponse(ok=True, data=config)
+
+
+@router.post("/architect/ai-config", response_model=ApiResponse)
+async def save_ai_config(request: Request):
+    config = await request.json()
+    result = await orchestrator.save_ai_config(config)
+    if result.get("status") == "error":
+        return ApiResponse(ok=False, message=result.get("message"))
+    return ApiResponse(ok=True, message="Configuración de IA guardada")
+
+
+@router.post("/architect/validate-ai", response_model=ApiResponse)
+async def validate_ai(request: Request):
+    data = await request.json()
+    url = data.get("url")
+    key = data.get("key")
+    provider = data.get("provider")
+    
+    result = await orchestrator.validate_ai_provider(url, key, provider)
+    if result.get("ok"):
+        return ApiResponse(ok=True, data=result.get("models"))
+    return ApiResponse(ok=False, message=result.get("error"))
+
+
+@router.post("/architect/init", response_model=ApiResponse, summary="Lanzar Wizard de Architect para el proyecto activo")
+async def architect_init(request: Request):
+    data = await request.json()
+    pattern = data.get("pattern")
+    result = await orchestrator.architect_init(pattern=pattern)
+    if isinstance(result, dict) and "error" in result:
+        return ApiResponse(ok=False, message=result["error"])
+    return ApiResponse(ok=True, message="Proceso de inicialización lanzado")
