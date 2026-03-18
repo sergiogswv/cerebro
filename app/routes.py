@@ -15,6 +15,7 @@ async def receive_event(event: AgentEvent):
     envían sus eventos aquí. El Orquestador evalúa y actúa.
     """
     try:
+        logger.info(f"🔔 EVENTO [{event.source}] {event.type}: {event.payload}")
         result = await orchestrator.handle_event(event)
         return ApiResponse(ok=True, message="evento procesado", data=result)
     except Exception as e:
@@ -86,12 +87,18 @@ async def interaction_response(request: Request):
     Recibe la respuesta de una interacción de usuario (e.g., desde Telegram)
     y la reenvía al agente Sentinel.
     """
+    from app.sockets import pending_interaction_events
+
     body = await request.json()
     prompt_id = body.get("prompt_id")
     answer = body.get("answer")
 
     if not prompt_id or not answer:
         raise HTTPException(status_code=400, detail="prompt_id y answer son requeridos")
+
+    # Limpiar el evento de interacción de la cola de pendientes
+    pending_interaction_events[:] = [e for e in pending_interaction_events if e.get('payload', {}).get('prompt_id') != prompt_id]
+    logger.info(f"✅ Evento de interacción {prompt_id} respondido y eliminado de pendientes")
 
     # Reenviar al agente (por ahora asumimos sentinel como origen principal de interacciones)
     await send_command(
@@ -164,3 +171,28 @@ async def architect_init(request: Request):
     if isinstance(result, dict) and "error" in result:
         return ApiResponse(ok=False, message=result["error"])
     return ApiResponse(ok=True, message="Proceso de inicialización lanzado")
+
+
+@router.get("/sentinel/config", response_model=ApiResponse, summary="Obtener config de Sentinel del proyecto activo")
+async def get_sentinel_config():
+    result = await orchestrator.get_sentinel_config()
+    if isinstance(result, dict) and "error" in result:
+        return ApiResponse(ok=False, message=result["error"])
+    return ApiResponse(ok=True, data=result)
+
+
+@router.post("/sentinel/config", response_model=ApiResponse, summary="Guardar config de Sentinel del proyecto activo")
+async def save_sentinel_config(request: Request):
+    config = await request.json()
+    result = await orchestrator.save_sentinel_config(config)
+    if result.get("status") == "error":
+        return ApiResponse(ok=False, message=result.get("message"))
+    return ApiResponse(ok=True, message="Configuración de Sentinel guardada exitosamente")
+
+
+@router.post("/sentinel/init", response_model=ApiResponse, summary="Lanzar Wizard de Sentinel para el proyecto activo")
+async def sentinel_init():
+    result = await orchestrator.sentinel_init()
+    if isinstance(result, dict) and "error" in result:
+        return ApiResponse(ok=False, message=result["error"])
+    return ApiResponse(ok=True, message="Proceso de inicialización de Sentinel lanzado")

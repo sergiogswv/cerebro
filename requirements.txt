@@ -2,5 +2,7 @@ fastapi
 uvicorn[standard]
 httpx
 pydantic
+pydantic-settings
 python-dotenv
 python-socketio
+psutil

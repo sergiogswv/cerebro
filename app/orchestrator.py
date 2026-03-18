@@ -5,6 +5,8 @@ from app.dispatcher import send_command, notify
 
 logger = logging.getLogger("cerebro.orchestrator")
 
+from app.config import get_settings
+settings = get_settings()
 
 class Orchestrator:
     """
@@ -17,7 +19,8 @@ class Orchestrator:
 
     def __init__(self):
         self.active_project = None
-        self.workspace_root = "C:/Users/Sergio/Documents/dev"
+        self.monitored_project = None # Rastreo de éxito de monitorización
+        self.workspace_root = settings.workspace_root
 
     async def handle_event(self, event: AgentEvent) -> dict:
         from app.sockets import emit_agent_event
@@ -124,7 +127,7 @@ class Orchestrator:
                         "prompt_id": prompt_id,
                         "source": event.source # Para saber a quien responder luego
                     },
-                    timeout=5.0
+                    timeout=30.0 # Aumentado de 5.0 a 30.0
                 )
             return {"action": "ask_interaction", "status": "sent", "prompt_id": prompt_id}
         except Exception as e:
@@ -174,20 +177,28 @@ class Orchestrator:
             import httpx
             settings = get_settings()
             
-            async with httpx.AsyncClient() as client:
-                await client.post(
-                    f"{settings.notifier_url}/ask-project",
-                    json={"projects": projects},
-                    timeout=5.0
-                )
+            try:
+                async with httpx.AsyncClient() as client:
+                    await client.post(
+                        f"{settings.notifier_url}/ask-project",
+                        json={"projects": projects},
+                        timeout=10.0 # Aumentado de 2.0 a 10.0
+                    )
+            except Exception as e:
+                logger.warning(f"⚠️ Notificador no disponible: {e}. El sistema funcionará solo via Dashboard.")
             
-            return {"status": "ok", "scanned": len(projects)}
+            return {"status": "ok", "scanned": len(projects), "projects": projects}
         except Exception as e:
             logger.error(f"Error en bootstrap: {e}")
             return {"status": "error", "message": str(e)}
 
     async def set_active_project(self, project_name: str):
         """Configura el proyecto en el que se trabajara"""
+        # Solo omitimos si el proyecto es el mismo Y ya logramos monitorearlo con éxito
+        if self.active_project == project_name and self.monitored_project == project_name:
+            logger.info(f"ℹ️ El proyecto {project_name} ya está activo y monitoreado. Omitiendo duplicidad.")
+            return {"status": "ok", "project": project_name, "restarted": False}
+        
         self.active_project = project_name
         logger.info(f"📁 Proyecto activo establecido: {project_name}")
         
@@ -197,18 +208,26 @@ class Orchestrator:
         # Arrancar Sentinel automaticamente para ese proyecto
         project_path = os.path.join(self.workspace_root, project_name).replace("\\", "/")
         
-        await send_command(
+        ack = await send_command(
             "sentinel",
             OrchestratorCommand(action="monitor", target=project_path)
         )
         
+        # Si el monitor fue aceptado, registramos el éxito
+        if ack.get("status") != "rejected":
+            self.monitored_project = project_name
+            logger.info(f"✅ Sentinel monitoreando exitosamente: {project_name}")
+        else:
+            self.monitored_project = None
+            logger.warning(f"⚠️ Sentinel no pudo iniciar monitoreo (posiblemente aún arrancando): {ack.get('error')}")
+
         await notify(
             f"Listo! He configurado el entorno para `{project_name}`.\nSentinel y Architect estan preparados.",
             level="info",
             source="cerebro"
         )
         
-        return {"status": "ok", "project": project_name}
+        return {"status": "ok", "project": project_name, "restarted": True}
 
     async def get_architect_config(self) -> dict:
         """Lee el archivo architect.json del proyecto activo"""
@@ -259,6 +278,56 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Error guardando architect.json: {e}")
             return {"status": "error", "message": str(e)}
+
+    async def get_sentinel_config(self) -> dict:
+        """Lee el archivo .sentinelrc.toml del proyecto activo"""
+        if not self.active_project:
+            return {"error": "No hay proyecto activo seleccionado"}
+        
+        config_path = os.path.join(self.workspace_root, self.active_project, ".sentinelrc.toml")
+        if not os.path.exists(config_path):
+            return {"error": "Archivo .sentinelrc.toml no encontrado"}
+            
+        import toml
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                return toml.load(f)
+        except Exception as e:
+            logger.error(f"Error leyendo .sentinelrc.toml: {e}")
+            return {"error": str(e)}
+
+    async def save_sentinel_config(self, config: dict) -> dict:
+        """Guarda el archivo .sentinelrc.toml en el proyecto activo"""
+        if not self.active_project:
+            return {"error": "No hay proyecto activo seleccionado"}
+            
+        config_path = os.path.join(self.workspace_root, self.active_project, ".sentinelrc.toml")
+        import toml
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                toml.dump(config, f)
+            return {"status": "ok"}
+        except Exception as e:
+            logger.error(f"Error guardando .sentinelrc.toml: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def sentinel_init(self) -> dict:
+        """Lanza el comando de inicialización de Sentinel"""
+        if not self.active_project:
+            return {"error": "No hay proyecto activo seleccionado"}
+            
+        project_path = os.path.join(self.workspace_root, self.active_project).replace("\\", "/")
+        
+        # Enviar comando a Sentinel para que se inicialice (o re-inicialice)
+        ack = await send_command(
+            "sentinel",
+            OrchestratorCommand(
+                action="monitor", # Sentinel proyecta el setup si no hay config al monitorear
+                target=project_path
+            )
+        )
+        
+        return {"status": "ok", "ack": ack}
 
     async def architect_init(self, pattern: str | None = None) -> dict:
         """Llama al ejecutor para correr el comando 'init' de Architect en el proyecto activo"""
@@ -345,14 +414,42 @@ class Orchestrator:
             return {"error": str(e)}
 
     async def save_ai_config(self, config: dict) -> dict:
-        """Guarda .architect.ai.json en el proyecto activo"""
+        """Guarda .architect.ai.json en el proyecto activo y propaga a Sentinel si aplica"""
         if not self.active_project:
             return {"error": "No hay proyecto activo"}
-        path = os.path.join(self.workspace_root, self.active_project, ".architect.ai.json")
+        
+        project_dir = os.path.join(self.workspace_root, self.active_project)
+        ai_path = os.path.join(project_dir, ".architect.ai.json")
+        sentinel_path = os.path.join(project_dir, ".sentinelrc.toml")
+
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                import json
+            # 1. Guardar config global (JSON)
+            import json
+            with open(ai_path, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2)
+            
+            # 2. Propagar a Sentinel si hay una selección activa
+            selected_name = config.get("selected_name")
+            if selected_name and os.path.exists(sentinel_path):
+                selected_config = next((c for c in config.get("configs", []) if c.get("name") == selected_name), None)
+                if selected_config:
+                    import toml
+                    with open(sentinel_path, "r", encoding="utf-8") as f:
+                        sentinel_contents = toml.load(f)
+                    
+                    # Actualizar sección primary_model
+                    sentinel_contents["primary_model"] = {
+                        "name": selected_config.get("model", ""),
+                        "url": selected_config.get("api_url", ""),
+                        "api_key": selected_config.get("api_key", ""),
+                        "provider": selected_config.get("provider", "anthropic").lower()
+                    }
+
+                    with open(sentinel_path, "w", encoding="utf-8") as f:
+                        toml.dump(sentinel_contents, f)
+                    
+                    logger.info(f"🚀 AI Config propagada a Sentinel en {self.active_project}")
+
             return {"status": "success"}
         except Exception as e:
             logger.error(f"Error guardando AI config: {e}")

@@ -1,12 +1,41 @@
+# Entornos virtuales
+venv/
 .venv/
+env/
+.env/
+
+# Python caching y compilación
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.nox/
+.tox/
+
+# Variables de entorno (¡CRÍTICO!)
 .env
+.env.local
+.env.dev
+.env.prod
+*.env
+
+# IDEs y Editores
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Bases de datos y logs
 *.db
 *.sqlite
-.DS_Store
+*.log
+logs/
+
+# Distribución
 dist/
-.pytest_cache/
-htmlcov/
-.coverage
+build/
+*.egg-info/

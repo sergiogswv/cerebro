@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     # Servidor
     port: int = 4000
     orchestrator_mode: str = "rest"  # "rest" | "adk"
+    workspace_root: str = "/home/protec/Documentos/dev"
 
     # URLs de agentes
     sentinel_url: str = "http://127.0.0.1:4001"
