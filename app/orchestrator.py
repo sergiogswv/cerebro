@@ -497,6 +497,74 @@ class Orchestrator:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    async def warden_scan(self, project: str | None = None) -> dict:
+        """Ejecuta un escaneo de Warden sobre el proyecto activo o uno específico"""
+        target = project or self.active_project
+        if not target:
+            return {"error": "No hay proyecto activo ni se especificó uno"}
+
+        # Enviar comando al Ejecutor para ejecutar Warden en modo one-shot
+        ack = await send_command(
+            "ejecutor",
+            OrchestratorCommand(
+                action="scan",
+                service="warden",
+                target=target
+            )
+        )
+        return ack
+
+    async def warden_predict_critical(self, project: str | None = None) -> dict:
+        """Predice archivos críticos para el proyecto activo"""
+        target = project or self.active_project
+        if not target:
+            return {"error": "No hay proyecto activo ni se especificó uno"}
+
+        ack = await send_command(
+            "ejecutor",
+            OrchestratorCommand(
+                action="scan",
+                service="warden",
+                target=target,
+                options={"only_predictions": True}
+            )
+        )
+        return ack
+
+    async def warden_risk_assess(self, project: str | None = None) -> dict:
+        """Evalúa riesgos del proyecto activo"""
+        target = project or self.active_project
+        if not target:
+            return {"error": "No hay proyecto activo ni se especificó uno"}
+
+        ack = await send_command(
+            "ejecutor",
+            OrchestratorCommand(
+                action="scan",
+                service="warden",
+                target=target,
+                options={"only_hotspots": True}
+            )
+        )
+        return ack
+
+    async def warden_churn_report(self, project: str | None = None) -> dict:
+        """Genera reporte de churn del proyecto activo"""
+        target = project or self.active_project
+        if not target:
+            return {"error": "No hay proyecto activo ni se especificó uno"}
+
+        ack = await send_command(
+            "ejecutor",
+            OrchestratorCommand(
+                action="scan",
+                service="warden",
+                target=target,
+                options={"only_trends": True}
+            )
+        )
+        return ack
+
 
 # Instancia global del orquestador
 orchestrator = Orchestrator()

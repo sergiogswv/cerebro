@@ -196,3 +196,97 @@ async def sentinel_init():
     if isinstance(result, dict) and "error" in result:
         return ApiResponse(ok=False, message=result["error"])
     return ApiResponse(ok=True, message="Proceso de inicialización de Sentinel lanzado")
+
+
+# ─── Warden Endpoints ─────────────────────────────────────────────────────────
+
+@router.post("/warden/scan", response_model=ApiResponse, summary="Ejecutar escaneo de Warden")
+async def warden_scan():
+    """Ejecuta un escaneo completo de Warden sobre el proyecto activo"""
+    from app.sockets import emit_agent_event
+
+    result = await orchestrator.warden_scan()
+    if isinstance(result, dict) and "error" in result:
+        return ApiResponse(ok=False, message=result["error"])
+
+    # Emitir evento para que el Dashboard lo muestre
+    await emit_agent_event({
+        "source": "warden",
+        "type": "scan_completed",
+        "severity": "info",
+        "payload": {
+            "message": "Warden scan completado",
+            "result": result
+        }
+    })
+
+    return ApiResponse(ok=True, message="Escaneo de Warden ejecutado", data=result)
+
+
+@router.post("/warden/predict-critical", response_model=ApiResponse, summary="Predecir archivos críticos")
+async def warden_predict_critical():
+    """Predice archivos que se volverán críticos"""
+    from app.sockets import emit_agent_event
+
+    result = await orchestrator.warden_predict_critical()
+    if isinstance(result, dict) and "error" in result:
+        return ApiResponse(ok=False, message=result["error"])
+
+    # Emitir evento para que el Dashboard lo muestre
+    await emit_agent_event({
+        "source": "warden",
+        "type": "predict_critical_completed",
+        "severity": "info",
+        "payload": {
+            "message": "Predicción de críticos completada",
+            "result": result
+        }
+    })
+
+    return ApiResponse(ok=True, message="Predicción de críticos ejecutada", data=result)
+
+
+@router.post("/warden/risk-assess", response_model=ApiResponse, summary="Evaluar riesgos del proyecto")
+async def warden_risk_assess():
+    """Evalúa riesgos de archivos del proyecto activo"""
+    from app.sockets import emit_agent_event
+
+    result = await orchestrator.warden_risk_assess()
+    if isinstance(result, dict) and "error" in result:
+        return ApiResponse(ok=False, message=result["error"])
+
+    # Emitir evento para que el Dashboard lo muestre
+    await emit_agent_event({
+        "source": "warden",
+        "type": "risk_assess_completed",
+        "severity": "info",
+        "payload": {
+            "message": "Evaluación de riesgos completada",
+            "result": result
+        }
+    })
+
+    return ApiResponse(ok=True, message="Evaluación de riesgos completada", data=result)
+
+
+@router.post("/warden/churn-report", response_model=ApiResponse, summary="Generar reporte de churn")
+async def warden_churn_report():
+    """Genera reporte de churn del proyecto activo"""
+    from app.sockets import emit_agent_event
+
+    result = await orchestrator.warden_churn_report()
+    if isinstance(result, dict) and "error" in result:
+        return ApiResponse(ok=False, message=result["error"])
+
+    # Emitir evento para que el Dashboard lo muestre
+    await emit_agent_event({
+        "source": "warden",
+        "type": "churn_report_completed",
+        "severity": "info",
+        "payload": {
+            "message": "Reporte de churn generado",
+            "result": result
+        }
+    })
+
+    return ApiResponse(ok=True, message="Reporte de churn generado", data=result)
