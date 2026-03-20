@@ -11,6 +11,13 @@ socket_app = socketio.ASGIApp(sio)
 # Cola de eventos pendientes para clientes que se conecten después
 pending_interaction_events = []
 
+# Estado de readiness de los agentes (para enviar a clientes que se conecten)
+agent_ready_state = {
+    'sentinel': False,
+    'architect': False,
+    'warden': False,
+}
+
 @sio.event
 async def connect(sid, environ):
     logger.info(f"🔌 Cliente conectado: {sid}")
@@ -22,6 +29,20 @@ async def connect(sid, environ):
         except Exception as e:
             logger.error(f"❌ Error enviando evento pendiente: {e}")
 
+    # Enviar estado de readiness de los agentes
+    for agent, ready in agent_ready_state.items():
+        if ready:
+            try:
+                await sio.emit('agent_event', {
+                    'source': agent,
+                    'type': f'{agent}_ready',
+                    'severity': 'info',
+                    'payload': {'ready': True}
+                }, to=sid)
+                logger.debug(f"📤 Estado ready de {agent} enviado a {sid}")
+            except Exception as e:
+                logger.error(f"❌ Error enviando estado ready de {agent}: {e}")
+
 @sio.event
 async def disconnect(sid):
     logger.info(f"🔌 Cliente desconectado: {sid}")
@@ -30,12 +51,20 @@ async def emit_agent_event(event_data: dict):
     """
     Emite un evento de agente a todos los clientes conectados.
     Guarda eventos de interacción pendientes para clientes futuros.
+    También guarda el estado de readiness de los agentes.
     """
     try:
         # Guardar eventos de interacción para clientes que se conecten después
         if event_data.get('type') == 'interaction_required':
             pending_interaction_events.append(event_data)
             logger.info(f"💾 Evento de interacción guardado (pendientes: {len(pending_interaction_events)})")
+
+        # Guardar estado de readiness de los agentes
+        if event_data.get('type') in ['sentinel_ready', 'architect_ready', 'warden_ready']:
+            agent = event_data.get('source')
+            if agent and agent in agent_ready_state:
+                agent_ready_state[agent] = True
+                logger.info(f"💾 Estado {agent}_ready guardado")
 
         await sio.emit('agent_event', event_data)
         logger.debug(f"📤 Evento emitido por Socket.IO: {event_data.get('type')}")

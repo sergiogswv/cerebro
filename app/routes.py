@@ -173,6 +173,72 @@ async def architect_init(request: Request):
     return ApiResponse(ok=True, message="Proceso de inicialización lanzado")
 
 
+@router.post("/architect/command", response_model=ApiResponse, summary="Enviar comando a Architect")
+async def architect_command(request: Request):
+    """Envía un comando a Architect para el proyecto activo"""
+    from app.sockets import emit_agent_event
+    from app.dispatcher import send_raw_command
+    import uuid
+    import os
+
+    data = await request.json()
+    action = data.get("action", "lint")
+    target = data.get("target", orchestrator.active_project)
+
+    # Convertir nombre del proyecto a ruta completa
+    project_path = "."
+    if target and target != "Ninguno":
+        project_path = os.path.join(orchestrator.workspace_root, target).replace("\\", "/")
+
+    # Enviar comando a Architect vía dispatcher
+    command = {
+        "action": action,
+        "target": project_path,
+        "request_id": f"architect-{str(uuid.uuid4())[:8]}"
+    }
+
+    ack = await send_raw_command("architect", command)
+    if isinstance(ack, dict) and ack.get("status") == "rejected":
+        return ApiResponse(ok=False, message=ack.get("error", "Comando rechazado"))
+
+    # Mensajes descriptivos para cada acción
+    action_messages = {
+        "lint": "🔍 Análisis de linting en progreso...",
+        "deep-analysis": "🧠 Análisis profundo de arquitectura iniciado...",
+        "check-circular": "🔄 Buscando dependencias circulares...",
+        "full-report": "📊 Generando reporte completo de arquitectura...",
+        "validate-config": "✅ Validando configuración de architect.json...",
+        "analyze-stale": "🕰️ Buscando archivos stale con alta complejidad..."
+    }
+
+    # Determinar estado del resultado
+    result_status = "completed"
+    if isinstance(ack, dict):
+        ack_status = ack.get("status", "")
+        if ack_status == "error":
+            result_status = "error"
+        elif ack_status in ["accepted", "completed"]:
+            result_status = "completed"
+
+    # Emitir evento para que el Dashboard lo muestre
+    # Convertir guiones a guiones bajos para coincidir con eventos de Architect (ej: deep-analysis -> deep_analysis)
+    event_type = f"command_{action.replace('-', '_')}"
+    await emit_agent_event({
+        "source": "architect",
+        "type": event_type,
+        "severity": "info",
+        "payload": {
+            "action": action,
+            "target": target,
+            "status": result_status,
+            "message": action_messages.get(action, f"🚀 Ejecutando acción: {action}"),
+            "result": ack.get("result") if isinstance(ack, dict) else None
+        }
+    })
+
+    return ApiResponse(ok=True, message=f"Comando '{action}' enviado a Architect", data=ack)
+
+
 @router.get("/sentinel/config", response_model=ApiResponse, summary="Obtener config de Sentinel del proyecto activo")
 async def get_sentinel_config():
     result = await orchestrator.get_sentinel_config()
@@ -196,6 +262,258 @@ async def sentinel_init():
     if isinstance(result, dict) and "error" in result:
         return ApiResponse(ok=False, message=result["error"])
     return ApiResponse(ok=True, message="Proceso de inicialización de Sentinel lanzado")
+
+
+@router.post("/sentinel/command", response_model=ApiResponse, summary="Enviar comando Pro a Sentinel")
+async def sentinel_command(request: Request):
+    """Envía un comando Pro a Sentinel para el proyecto activo"""
+    from app.sockets import emit_agent_event
+    import uuid
+    import os
+
+    data = await request.json()
+    action = data.get("action", "pro")
+    subcommand = data.get("subcommand", "check")
+    target = data.get("target", orchestrator.active_project)
+
+    # Convertir nombre del proyecto a ruta completa
+    project_path = "."
+    if target and target != "Ninguno":
+        project_path = os.path.join(orchestrator.workspace_root, target).replace("\\", "/")
+
+    # Enviar comando a Sentinel vía dispatcher
+    command = {
+        "action": action,
+        "subcommand": subcommand,
+        "target": project_path,
+        "request_id": f"sentinel-{str(uuid.uuid4())[:8]}"
+    }
+
+    from app.dispatcher import send_raw_command
+    ack = await send_raw_command("sentinel", command)
+    if isinstance(ack, dict) and ack.get("status") == "rejected":
+        return ApiResponse(ok=False, message=ack.get("error", "Comando rechazado"))
+
+    # Mensajes descriptivos para cada acción Pro
+    action_messages = {
+        "check": "🔍 Quick Check: Análisis estático rápido en progreso...",
+        "audit": "🛡️ Audit: Auditoría con correcciones IA en progreso...",
+        "report": "📊 Report: Generando reporte de calidad...",
+        "fix": "⚡ Auto Fix: Corrigiendo bugs automáticamente...",
+        "review": "🔄 Review: Realizando review de arquitectura...",
+        "clean-cache": "🗑️ Clean Cache: Limpiando caché de IA..."
+    }
+
+    # Determinar estado del resultado
+    result_status = "completed"
+    if isinstance(ack, dict):
+        ack_status = ack.get("status", "")
+        if ack_status == "error":
+            result_status = "error"
+        elif ack_status in ["accepted", "completed"]:
+            result_status = "completed"
+
+    # Emitir evento para que el Dashboard lo muestre
+    # Tipo: pro_check, pro_audit, pro_report, etc.
+    event_type = f"pro_{subcommand.replace('-', '_')}"
+    await emit_agent_event({
+        "source": "sentinel",
+        "type": event_type,
+        "severity": "info",
+        "payload": {
+            "action": subcommand,
+            "target": target,
+            "status": result_status,
+            "message": action_messages.get(subcommand, f"🚀 Ejecutando acción Pro: {subcommand}"),
+            "result": ack.get("result") if isinstance(ack, dict) else None
+        }
+    })
+
+    return ApiResponse(ok=True, message=f"Comando '{subcommand}' enviado a Sentinel", data=ack)
+
+
+# ─── Sentinel Monitor Commands ────────────────────────────────────────────────
+
+@router.post("/sentinel/monitor/pause", response_model=ApiResponse, summary="Pausar/Reanudar monitoreo de Sentinel")
+async def sentinel_monitor_pause(request: Request):
+    """Pausa o reanuda el monitoreo de cambios en tiempo real de Sentinel"""
+    from app.sockets import emit_agent_event
+    import uuid
+
+    data = await request.json() if await request.body() else {}
+    target = data.get("target", orchestrator.active_project)
+
+    # Enviar comando a Sentinel vía dispatcher usando el formato correcto
+    command = {
+        "action": "monitor/pause",
+        "target": target,
+        "request_id": f"monitor-{str(uuid.uuid4())[:8]}"
+    }
+
+    from app.dispatcher import send_raw_command
+    ack = await send_raw_command("sentinel", command)
+
+    # Emitir evento con el resultado
+    await emit_agent_event({
+        "source": "sentinel",
+        "type": "monitor_pause",
+        "severity": "info",
+        "payload": {
+            "message": "Estado del monitoreo actualizado",
+            "paused": ack.get("result", {}).get("paused") if isinstance(ack, dict) else None,
+            "result": ack
+        }
+    })
+
+    return ApiResponse(ok=True, message="Comando pause enviado a Sentinel", data=ack)
+
+
+@router.post("/sentinel/monitor/daily-report", response_model=ApiResponse, summary="Generar reporte diario de productividad")
+async def sentinel_monitor_daily_report(request: Request):
+    """Genera reporte diario de productividad basado en commits de Git"""
+    from app.sockets import emit_agent_event
+    import uuid
+
+    data = await request.json() if await request.body() else {}
+    target = data.get("target", orchestrator.active_project)
+
+    command = {
+        "action": "monitor/daily-report",
+        "target": target,
+        "request_id": f"daily-report-{str(uuid.uuid4())[:8]}"
+    }
+
+    from app.dispatcher import send_raw_command
+    ack = await send_raw_command("sentinel", command)
+
+    await emit_agent_event({
+        "source": "sentinel",
+        "type": "daily_report",
+        "severity": "info",
+        "payload": {
+            "message": "Generando reporte diario de productividad...",
+            "result": ack
+        }
+    })
+
+    return ApiResponse(ok=True, message="Reporte diario solicitado", data=ack)
+
+
+@router.get("/sentinel/monitor/metrics", response_model=ApiResponse, summary="Obtener métricas de Sentinel")
+async def sentinel_monitor_metrics():
+    """Obtiene dashboard de métricas (bugs, costos, tokens) de Sentinel"""
+    from app.sockets import emit_agent_event
+
+    # Métricas de ejemplo (en producción venir de SentinelStats)
+    metrics = {
+        "bugs_evitados": 0,
+        "costo_acumulado": 0.0,
+        "tokens_usados": 0,
+        "tiempo_ahorrado_mins": 0
+    }
+
+    await emit_agent_event({
+        "source": "sentinel",
+        "type": "metrics",
+        "severity": "info",
+        "payload": {
+            "message": "Métricas de Sentinel obtenidas",
+            "metrics": metrics
+        }
+    })
+
+    return ApiResponse(ok=True, message="Métricas obtenidas", data=metrics)
+
+
+@router.post("/sentinel/monitor/testing", response_model=ApiResponse, summary="Obtener sugerencias de testing")
+async def sentinel_monitor_testing(request: Request):
+    """Obtiene sugerencias de testing complementarias para el proyecto activo"""
+    from app.sockets import emit_agent_event
+    import uuid
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        data = await request.json() if await request.body() else {}
+    except Exception as e:
+        logger.warning(f"Error leyendo request body: {e}")
+        data = {}
+
+    target = data.get("target", orchestrator.active_project)
+
+    logger.info(f"🎯 Target: {target}, Active project: {orchestrator.active_project}")
+
+    command = {
+        "action": "monitor/testing",
+        "target": target,
+        "request_id": f"testing-{str(uuid.uuid4())[:8]}"
+    }
+
+    logger.info(f"🔧 Enviando comando testing a Sentinel: {command}")
+
+    from app.dispatcher import send_raw_command
+    try:
+        ack = await send_raw_command("sentinel", command)
+    except Exception as e:
+        logger.error(f"❌ Error ejecutando comando: {e}")
+        ack = {"status": "error", "error": str(e)}
+
+    logger.info(f"📥 Respuesta de Sentinel: {ack}")
+
+    # Solo emitir evento si hay resultado exitoso
+    if isinstance(ack, dict) and ack.get("status") in ["completed", "accepted"]:
+        event_payload = {
+            "source": "sentinel",
+            "type": "testing_suggestions",
+            "severity": "info",
+            "payload": {
+                "message": ack.get("result", {}).get("message", "Sugerencias de testing generadas"),
+                "result": ack
+            }
+        }
+
+        logger.info(f"📤 Emitiendo evento: {event_payload}")
+        try:
+            await emit_agent_event(event_payload)
+            logger.info("✅ Evento emitido exitosamente")
+        except Exception as e:
+            logger.error(f"❌ Error emitiendo evento: {e}")
+    else:
+        logger.error(f"❌ Error en comando testing: {ack}")
+
+    return ApiResponse(ok=True, message="Sugerencias de testing solicitadas", data=ack)
+
+
+@router.post("/sentinel/monitor/reset-config", response_model=ApiResponse, summary="Reiniciar configuración de Sentinel")
+async def sentinel_monitor_reset_config(request: Request):
+    """Reinicia la configuración de Sentinel del proyecto activo"""
+    from app.sockets import emit_agent_event
+    import uuid
+
+    data = await request.json() if await request.body() else {}
+    target = data.get("target", orchestrator.active_project)
+
+    command = {
+        "action": "monitor/reset-config",
+        "target": target,
+        "request_id": f"reset-config-{str(uuid.uuid4())[:8]}"
+    }
+
+    from app.dispatcher import send_raw_command
+    ack = await send_raw_command("sentinel", command)
+
+    await emit_agent_event({
+        "source": "sentinel",
+        "type": "reset_config",
+        "severity": "warning",
+        "payload": {
+            "message": "Reiniciando configuración de Sentinel...",
+            "result": ack
+        }
+    })
+
+    return ApiResponse(ok=True, message="Reinicio de configuración solicitado", data=ack)
 
 
 # ─── Warden Endpoints ─────────────────────────────────────────────────────────
