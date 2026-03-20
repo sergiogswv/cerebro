@@ -173,6 +173,30 @@ async def architect_init(request: Request):
     return ApiResponse(ok=True, message="Proceso de inicialización lanzado")
 
 
+@router.get("/architect/ai-rules", response_model=ApiResponse, summary="Generar reglas con IA para un patrón")
+async def get_ai_rules(pattern: str = None, project: str = None):
+    """
+    Genera reglas de arquitectura usando IA para un patrón específico.
+    Si no se especifica patrón, realiza análisis automático.
+    """
+    result = await orchestrator.generate_ai_rules_for_pattern(pattern, project)
+    if isinstance(result, dict) and "error" in result:
+        return ApiResponse(ok=False, message=result["error"])
+    return ApiResponse(ok=True, data=result)
+
+
+@router.get("/architect/ai-suggestions", response_model=ApiResponse, summary="Obtener sugerencias de arquitecturas desde IA")
+async def get_ai_suggestions(project: str = None):
+    """
+    Obtiene sugerencias de top 3 arquitecturas desde IA.
+    Si no hay IA configurada, retorna patrones por defecto.
+    """
+    result = await orchestrator.get_ai_architecture_suggestions(project)
+    if isinstance(result, dict) and "error" in result:
+        return ApiResponse(ok=False, message=result["error"])
+    return ApiResponse(ok=True, data=result)
+
+
 @router.post("/architect/command", response_model=ApiResponse, summary="Enviar comando a Architect")
 async def architect_command(request: Request):
     """Envía un comando a Architect para el proyecto activo"""

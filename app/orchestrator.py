@@ -1,5 +1,6 @@
 import logging
 import os
+import json
 from app.models import AgentEvent, Severity, OrchestratorCommand
 from app.dispatcher import send_command, notify
 
@@ -333,9 +334,9 @@ class Orchestrator:
         """Llama al ejecutor para correr el comando 'init' de Architect en el proyecto activo"""
         if not self.active_project:
             return {"error": "No hay proyecto activo seleccionado"}
-            
+
         project_path = os.path.join(self.workspace_root, self.active_project).replace("\\", "/")
-        
+
         # LOG de inicio
         from app.sockets import emit_agent_event
         await emit_agent_event({
@@ -363,7 +364,92 @@ class Orchestrator:
                 options=options
             )
         )
-        
+
+        logger.info(f"🔵 architect_init ack: {ack}")
+
+        # Guardamos la configuración con las reglas del patrón (independientemente del ack)
+        # Definimos las reglas base para cada patrón
+        pattern_rules = {
+            "hexagonal": {
+                "rules": [
+                    {"name": "No Direct Infrastructure Imports", "pattern": "domain/**/*.* -> infrastructure/**/*.*", "severity": "error"},
+                    {"name": "Domain Independence", "pattern": "domain/**/*.* -> application/**/*.*", "severity": "error"}
+                ]
+            },
+            "clean": {
+                "rules": [
+                    {"name": "Entities Pure", "pattern": "entities/**/*.* -> use-cases/**/*.*", "severity": "error"},
+                    {"name": "Use Cases Isolation", "pattern": "use-cases/**/*.* -> adapters/**/*.*", "severity": "error"}
+                ]
+            },
+            "layered": {
+                "rules": [
+                    {"name": "No Upward Dependencies", "pattern": "controllers/**/*.* -> services/**/*.*", "severity": "warning"},
+                    {"name": "Repository Abstraction", "pattern": "services/**/*.* -> repositories/**/*.*", "severity": "error"}
+                ]
+            },
+            "ddd": {
+                "rules": [
+                    {"name": "Aggregate Root Access", "pattern": "**/*.* -> aggregates/**/root.*", "severity": "error"},
+                    {"name": "Value Object Immutability", "pattern": "value-objects/**/*.*", "severity": "warning"}
+                ]
+            },
+            "cqrs": {
+                "rules": [
+                    {"name": "Command Query Separation", "pattern": "commands/**/*.* -> queries/**/*.*", "severity": "error"},
+                    {"name": "Event Handler Isolation", "pattern": "handlers/**/*.* -> events/**/*.*", "severity": "warning"}
+                ]
+            },
+            "modular": {
+                "rules": [
+                    {"name": "Module Boundary", "pattern": "modules/*/internal/**/*.* -> modules/*/**/*.*", "severity": "error"},
+                    {"name": "Public API Only", "pattern": "modules/**/*.* -> modules/*/index.*", "severity": "error"}
+                ]
+            },
+            "mvc": {
+                "rules": [
+                    {"name": "No Business Logic in Controllers", "pattern": "controllers/**/*.* -> models/**/*.*", "severity": "error"},
+                    {"name": "View Isolation", "pattern": "views/**/*.* -> controllers/**/*.*", "severity": "warning"}
+                ]
+            },
+            "feature": {
+                "rules": [
+                    {"name": "Feature Encapsulation", "pattern": "features/*/internal/**/*.* -> features/*/**/*.*", "severity": "error"},
+                    {"name": "Shared Module Boundary", "pattern": "features/**/*.* -> shared/**/*.*", "severity": "warning"}
+                ]
+            },
+            "microkernel": {
+                "rules": [
+                    {"name": "Core Stability", "pattern": "plugins/**/*.* -> core/**/*.*", "severity": "error"},
+                    {"name": "Plugin Interface", "pattern": "core/**/*.* -> plugins/*/interface.*", "severity": "error"}
+                ]
+            },
+            "event": {
+                "rules": [
+                    {"name": "Event Handler Decoupling", "pattern": "handlers/**/*.* -> publishers/**/*.*", "severity": "error"},
+                    {"name": "Message Contract", "pattern": "messages/**/*.*", "severity": "warning"}
+                ]
+            }
+        }
+
+        # Guardar configuración con las reglas del patrón
+        config_path = os.path.join(project_path, "architect.json")
+        rules_to_save = pattern_rules.get(pattern, pattern_rules.get("layered"))
+
+        try:
+            import json
+            config_to_save = {
+                "name": f"{pattern}-architecture",
+                "rules": rules_to_save.get("rules", [])
+            }
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config_to_save, f, indent=2)
+
+            logger.info(f"✅ Configuración de arquitectura guardada en {config_path}")
+            logger.info(f"📄 Contenido guardado: {json.dumps(config_to_save, indent=2)}")
+        except Exception as e:
+            logger.error(f"❌ Error guardando configuración en {config_path}: {e}")
+
         # Si el comando terminó OK, avisamos al dashboard para que recargue
         await emit_agent_event({
             "source": "architect",
@@ -371,14 +457,14 @@ class Orchestrator:
             "severity": "info",
             "payload": {"message": "¡Magia completada! Arquitectura base generada exitosamente."}
         })
-        
+
         return {"status": "ok", "ack": ack}
     async def get_architect_patterns(self) -> list:
         """Retorna los patrones disponibles para el framework detectado en el proyecto activo"""
         if not self.active_project:
             return []
         project_path = os.path.join(self.workspace_root, self.active_project)
-        
+
         # Usamos el detector de Architect para saber el framework
         from app.dispatcher import AGENT_URLS
         import httpx
@@ -387,13 +473,20 @@ class Orchestrator:
             # Por ahora, devolvemos una lista genérica premium si es NestJS
             if os.path.exists(os.path.join(project_path, "nest-cli.json")):
                 return [
-                    {"id": "hexagonal", "label": "Hexagonal", "description": "domain/ application/ infrastructure/"},
-                    {"id": "clean", "label": "Clean Architecture", "description": "entities/ use-cases/ adapters/"},
-                    {"id": "layered", "label": "Layered", "description": "controllers/ services/ repos/"}
+                    {"id": "hexagonal", "label": "Hexagonal", "description": "Ports & Adapters. Domain at the core, infrastructure on the outside."},
+                    {"id": "clean", "label": "Clean Architecture", "description": "Uncle Bob's approach. Entities → Use Cases → Interface Adapters → Frameworks."},
+                    {"id": "layered", "label": "Layered (N-Layer)", "description": "Traditional separation: Presentation, Business, Data Access layers."},
+                    {"id": "ddd", "label": "Domain-Driven Design", "description": "Bounded contexts, aggregates, entities, and value objects."},
+                    {"id": "cqrs", "label": "CQRS + Event Sourcing", "description": "Command Query Responsibility Segregation with event persistence."},
+                    {"id": "modular", "label": "Modular Monolith", "description": "Single deployment unit with strict module boundaries and contracts."}
                 ]
             return [
-                {"id": "mvc", "label": "MVC", "description": "Classic Model-View-Controller"},
-                {"id": "hexagonal", "label": "Hexagonal", "description": "Domain-driven design"}
+                {"id": "mvc", "label": "MVC", "description": "Classic Model-View-Controller separation."},
+                {"id": "hexagonal", "label": "Hexagonal", "description": "Ports & Adapters pattern for testability."},
+                {"id": "layered", "label": "Layered", "description": "N-Tier architecture with clear separation."},
+                {"id": "feature", "label": "Feature-First", "description": "Organize by features/modules instead of technical layers."},
+                {"id": "microkernel", "label": "Microkernel", "description": "Core system + plugins for extensibility."},
+                {"id": "event", "label": "Event-Driven", "description": "Loose coupling through events and message handlers."}
             ]
         except:
             return []
@@ -458,13 +551,13 @@ class Orchestrator:
     async def validate_ai_provider(self, url: str, key: str, provider: str) -> dict:
         """Intenta listar modelos del proveedor para validar URL y API Key"""
         import httpx
-        
+
         # Normalizar URL (OpenAI/Claude suelen tener /v1/models o similar)
         endpoint = url.rstrip("/")
         if "ollama" in provider.lower():
             endpoint = f"{endpoint}/api/tags"
         elif "claude" in provider.lower() or "anthropic" in provider.lower():
-            # Anthropic no tiene un endpoint de 'models' tan simple como OpenAI, 
+            # Anthropic no tiene un endpoint de 'models' tan simple como OpenAI,
             # pero para validar solemos probar un request vacío o usar su metadata.
             # Por simplicidad en este prototipo, usamos el estándar OpenAI si la URL lo parece.
             if "/v1" not in endpoint: endpoint = f"{endpoint}/v1/models"
@@ -496,6 +589,169 @@ class Orchestrator:
                     return {"ok": False, "error": f"Error {resp.status_code}: {resp.text}"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    async def generate_ai_rules_for_pattern(self, pattern: str, project_path: str = None) -> dict:
+        """
+        Genera reglas de arquitectura usando IA para un patrón dado.
+        Similar al flujo del CLI: detecta framework, obtiene contexto, consulta IA.
+        """
+        from app.ai_utils import (
+            AIConfig, get_project_context, sugerir_reglas_para_patron,
+            sugerir_top_3_arquitecturas, sugerir_arquitectura_inicial
+        )
+
+        target_project = project_path or self.active_project
+        if not target_project:
+            return {"error": "No hay proyecto activo ni se especificó uno"}
+
+        # Ruta completa del proyecto
+        if os.path.isabs(target_project):
+            full_path = target_project
+        else:
+            full_path = os.path.join(self.workspace_root, target_project)
+
+        if not os.path.exists(full_path):
+            return {"error": f"Proyecto no encontrado: {full_path}"}
+
+        # Cargar configuración de IA del proyecto
+        ai_config_path = os.path.join(full_path, ".architect.ai.json")
+        ai_configs = []
+
+        if os.path.exists(ai_config_path):
+            try:
+                with open(ai_config_path, "r", encoding="utf-8") as f:
+                    ai_config_data = json.load(f)
+                    for cfg in ai_config_data.get("configs", []):
+                        ai_configs.append(AIConfig(
+                            name=cfg.get("name", "Unknown"),
+                            provider=cfg.get("provider", "Claude"),
+                            api_url=cfg.get("api_url", ""),
+                            api_key=cfg.get("api_key", ""),
+                            model=cfg.get("model", "")
+                        ))
+            except Exception as e:
+                logger.error(f"Error cargando AI config: {e}")
+                return {"error": "No hay configuración de IA válida. Configura una en el Architect Control Center."}
+        else:
+            return {"error": "No hay configuración de IA (.architect.ai.json). Configura una en el Architect Control Center > AI Config."}
+
+        if not ai_configs:
+            return {"error": "No hay proveedores de IA configurados. Agrega al menos uno en AI Config."}
+
+        # Obtener contexto del proyecto
+        context = get_project_context(full_path)
+        logger.info(f"🔍 Contexto del proyecto: framework={context['framework']}, deps={len(context['dependencies'])}, folders={len(context['folder_structure'])}")
+
+        # Si no se especificó patrón, hacer análisis automático
+        if not pattern:
+            logger.info("🧠 Realizando análisis automático de arquitectura con IA...")
+            result = await sugerir_arquitectura_inicial(context, ai_configs)
+            if not result:
+                return {"error": "No se pudo obtener una respuesta de la IA. Verifica la configuración de IA."}
+        else:
+            # Generar reglas para el patrón específico
+            logger.info(f"🧠 Generando reglas para patrón '{pattern}' con IA...")
+            result = await sugerir_reglas_para_patron(pattern, context, ai_configs)
+            if not result:
+                return {"error": "No se pudo obtener una respuesta de la IA. Verifica la configuración de IA."}
+
+        logger.info(f"✅ IA generó {len(result.rules)} reglas para el patrón '{result.pattern}'")
+
+        # Retornar reglas en formato serializable
+        return {
+            "ok": True,
+            "pattern": result.pattern,
+            "suggested_max_lines": result.suggested_max_lines,
+            "rules": [r.to_dict() for r in result.rules]
+        }
+
+    async def get_ai_architecture_suggestions(self, project_path: str = None) -> dict:
+        """
+        Obtiene sugerencias de top 3 arquitecturas desde IA.
+        """
+        from app.ai_utils import AIConfig, get_project_context, sugerir_top_3_arquitecturas
+
+        target_project = project_path or self.active_project
+        if not target_project:
+            return {"error": "No hay proyecto activo"}
+
+        full_path = os.path.join(self.workspace_root, target_project) if not os.path.isabs(target_project) else target_project
+
+        logger.info(f"🔍 get_ai_architecture_suggestions: target_project={target_project}, full_path={full_path}")
+
+        if not os.path.exists(full_path):
+            return {"error": f"Proyecto no encontrado: {full_path}"}
+
+        # Cargar configuración de IA
+        ai_config_path = os.path.join(full_path, ".architect.ai.json")
+        ai_configs = []
+
+        logger.info(f"🔍 Buscando AI config en: {ai_config_path}")
+        logger.info(f"🔍 ai_config_path exists: {os.path.exists(ai_config_path)}")
+
+        if os.path.exists(ai_config_path):
+            try:
+                with open(ai_config_path, "r", encoding="utf-8") as f:
+                    ai_config_data = json.load(f)
+                    logger.info(f"🔍 AI config data: {ai_config_data}")
+                    for cfg in ai_config_data.get("configs", []):
+                        ai_configs.append(AIConfig(
+                            name=cfg.get("name", "Unknown"),
+                            provider=cfg.get("provider", "Claude"),
+                            api_url=cfg.get("api_url", ""),
+                            api_key=cfg.get("api_key", ""),
+                            model=cfg.get("model", "")
+                        ))
+                    logger.info(f"🔍 Loaded {len(ai_configs)} AI configs")
+            except Exception as e:
+                logger.error(f"Error cargando AI config: {e}")
+
+        if not ai_configs:
+            # Retornar patrones por defecto si no hay IA configurada
+            logger.warning("⚠️ No hay AI configs, retornando patrones por defecto")
+            return {"default": True, "patterns": self._get_default_patterns(full_path)}
+
+        # Obtener contexto y sugerencias
+        logger.info(f"🧠 Obteniendo contexto del proyecto: {full_path}")
+        framework = get_project_context(full_path)["framework"]
+        logger.info(f"🧠 Framework detectado: {framework}")
+
+        logger.info(f"🧠 Llamando a sugerir_top_3_arquitecturas con framework={framework}, ai_configs={len(ai_configs)}")
+        top_3 = await sugerir_top_3_arquitecturas(framework, ai_configs)
+        logger.info(f"🧠 Resultado de sugerir_top_3_arquitecturas: {top_3}")
+
+        if not top_3:
+            logger.warning("⚠️ sugerir_top_3_arquitecturas retornó None o vacío, usando patrones por defecto")
+            return {"default": True, "patterns": self._get_default_patterns(full_path)}
+
+        return {
+            "ok": True,
+            "framework": framework,
+            "patterns": [
+                {"id": opt.name.lower().replace(" ", "-"), "label": opt.name, "description": opt.description}
+                for opt in top_3
+            ]
+        }
+
+    def _get_default_patterns(self, project_path: str) -> list:
+        """Retorna patrones por defecto si no hay IA disponible"""
+        if os.path.exists(os.path.join(project_path, "nest-cli.json")):
+            return [
+                {"id": "hexagonal", "label": "Hexagonal", "description": "Ports & Adapters. Domain at the core, infrastructure on the outside."},
+                {"id": "clean", "label": "Clean Architecture", "description": "Uncle Bob's approach. Entities → Use Cases → Interface Adapters → Frameworks."},
+                {"id": "layered", "label": "Layered (N-Layer)", "description": "Traditional separation: Presentation, Business, Data Access layers."},
+                {"id": "ddd", "label": "Domain-Driven Design", "description": "Bounded contexts, aggregates, entities, and value objects."},
+                {"id": "cqrs", "label": "CQRS + Event Sourcing", "description": "Command Query Responsibility Segregation with event persistence."},
+                {"id": "modular", "label": "Modular Monolith", "description": "Single deployment unit with strict module boundaries and contracts."}
+            ]
+        return [
+            {"id": "mvc", "label": "MVC", "description": "Classic Model-View-Controller separation."},
+            {"id": "hexagonal", "label": "Hexagonal", "description": "Ports & Adapters pattern for testability."},
+            {"id": "layered", "label": "Layered", "description": "N-Tier architecture with clear separation."},
+            {"id": "feature", "label": "Feature-First", "description": "Organize by features/modules instead of technical layers."},
+            {"id": "microkernel", "label": "Microkernel", "description": "Core system + plugins for extensibility."},
+            {"id": "event", "label": "Event-Driven", "description": "Loose coupling through events and message handlers."}
+        ]
 
     async def warden_scan(self, project: str | None = None) -> dict:
         """Ejecuta un escaneo de Warden sobre el proyecto activo o uno específico"""
