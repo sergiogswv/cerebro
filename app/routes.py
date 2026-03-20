@@ -524,7 +524,7 @@ async def warden_scan():
     from app.sockets import emit_agent_event
 
     result = await orchestrator.warden_scan()
-    if isinstance(result, dict) and "error" in result:
+    if isinstance(result, dict) and result.get("error"):
         return ApiResponse(ok=False, message=result["error"])
 
     # Emitir evento para que el Dashboard lo muestre
@@ -547,7 +547,7 @@ async def warden_predict_critical():
     from app.sockets import emit_agent_event
 
     result = await orchestrator.warden_predict_critical()
-    if isinstance(result, dict) and "error" in result:
+    if isinstance(result, dict) and result.get("error"):
         return ApiResponse(ok=False, message=result["error"])
 
     # Emitir evento para que el Dashboard lo muestre
@@ -570,7 +570,7 @@ async def warden_risk_assess():
     from app.sockets import emit_agent_event
 
     result = await orchestrator.warden_risk_assess()
-    if isinstance(result, dict) and "error" in result:
+    if isinstance(result, dict) and result.get("error"):
         return ApiResponse(ok=False, message=result["error"])
 
     # Emitir evento para que el Dashboard lo muestre
@@ -593,7 +593,7 @@ async def warden_churn_report():
     from app.sockets import emit_agent_event
 
     result = await orchestrator.warden_churn_report()
-    if isinstance(result, dict) and "error" in result:
+    if isinstance(result, dict) and result.get("error"):
         return ApiResponse(ok=False, message=result["error"])
 
     # Emitir evento para que el Dashboard lo muestre

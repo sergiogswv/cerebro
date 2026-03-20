@@ -503,15 +503,20 @@ class Orchestrator:
         if not target:
             return {"error": "No hay proyecto activo ni se especificó uno"}
 
-        # Enviar comando al Ejecutor para ejecutar Warden en modo one-shot
-        ack = await send_command(
-            "ejecutor",
-            OrchestratorCommand(
-                action="scan",
-                service="warden",
-                target=target
-            )
-        )
+        # Enviar comando directamente a Warden (modo servidor)
+        from app.dispatcher import send_raw_command
+        import uuid
+        import os
+
+        project_path = os.path.join(self.workspace_root, target).replace("\\", "/") if target != "." else "."
+
+        command = {
+            "action": "scan",
+            "target": project_path,
+            "request_id": f"warden-{str(uuid.uuid4())[:8]}"
+        }
+
+        ack = await send_raw_command("warden", command)
         return ack
 
     async def warden_predict_critical(self, project: str | None = None) -> dict:
@@ -520,15 +525,20 @@ class Orchestrator:
         if not target:
             return {"error": "No hay proyecto activo ni se especificó uno"}
 
-        ack = await send_command(
-            "ejecutor",
-            OrchestratorCommand(
-                action="scan",
-                service="warden",
-                target=target,
-                options={"only_predictions": True}
-            )
-        )
+        # Enviar comando directamente a Warden (modo servidor)
+        from app.dispatcher import send_raw_command
+        import uuid
+        import os
+
+        project_path = os.path.join(self.workspace_root, target).replace("\\", "/") if target != "." else "."
+
+        command = {
+            "action": "predict-critical",
+            "target": project_path,
+            "request_id": f"warden-{str(uuid.uuid4())[:8]}"
+        }
+
+        ack = await send_raw_command("warden", command)
         return ack
 
     async def warden_risk_assess(self, project: str | None = None) -> dict:
@@ -537,15 +547,20 @@ class Orchestrator:
         if not target:
             return {"error": "No hay proyecto activo ni se especificó uno"}
 
-        ack = await send_command(
-            "ejecutor",
-            OrchestratorCommand(
-                action="scan",
-                service="warden",
-                target=target,
-                options={"only_hotspots": True}
-            )
-        )
+        # Enviar comando directamente a Warden (modo servidor)
+        from app.dispatcher import send_raw_command
+        import uuid
+        import os
+
+        project_path = os.path.join(self.workspace_root, target).replace("\\", "/") if target != "." else "."
+
+        command = {
+            "action": "risk-assess",
+            "target": project_path,
+            "request_id": f"warden-{str(uuid.uuid4())[:8]}"
+        }
+
+        ack = await send_raw_command("warden", command)
         return ack
 
     async def warden_churn_report(self, project: str | None = None) -> dict:
@@ -554,15 +569,20 @@ class Orchestrator:
         if not target:
             return {"error": "No hay proyecto activo ni se especificó uno"}
 
-        ack = await send_command(
-            "ejecutor",
-            OrchestratorCommand(
-                action="scan",
-                service="warden",
-                target=target,
-                options={"only_trends": True}
-            )
-        )
+        # Enviar comando directamente a Warden (modo servidor)
+        from app.dispatcher import send_raw_command
+        import uuid
+        import os
+
+        project_path = os.path.join(self.workspace_root, target).replace("\\", "/") if target != "." else "."
+
+        command = {
+            "action": "churn-report",
+            "target": project_path,
+            "request_id": f"warden-{str(uuid.uuid4())[:8]}"
+        }
+
+        ack = await send_raw_command("warden", command)
         return ack
 
 
