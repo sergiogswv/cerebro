@@ -509,7 +509,7 @@ class Orchestrator:
     async def save_ai_config(self, config: dict) -> dict:
         """Guarda .architect.ai.json en el proyecto activo y propaga a Sentinel si aplica"""
         if not self.active_project:
-            return {"error": "No hay proyecto activo"}
+            return {"status": "error", "message": "No hay proyecto activo"}
         
         project_dir = os.path.join(self.workspace_root, self.active_project)
         ai_path = os.path.join(project_dir, ".architect.ai.json")
@@ -729,9 +729,9 @@ class Orchestrator:
                 logger.error(f"❌ No se pudo listar directorio: {e}")
 
         if not ai_configs:
-            # Retornar patrones por defecto si no hay IA configurada
-            logger.warning("⚠️ No hay AI configs después de procesar, retornando patrones por defecto")
-            return {"default": True, "patterns": self._get_default_patterns(full_path)}
+            # No hay IA configurada - devolver error para que el frontend pregunte
+            logger.warning("⚠️ No hay AI configs después de procesar")
+            return {"error": "No hay configuración de IA. Configura un proveedor en AI Config primero."}
 
         # Obtener contexto y sugerencias
         logger.info(f"🧠 Obteniendo contexto del proyecto: {full_path}")
@@ -761,23 +761,17 @@ class Orchestrator:
         }
 
     def _get_default_patterns(self, project_path: str) -> list:
-        """Retorna patrones por defecto si no hay IA disponible"""
+        """Retorna 3 patrones por defecto si no hay IA disponible"""
         if os.path.exists(os.path.join(project_path, "nest-cli.json")):
             return [
                 {"id": "hexagonal", "label": "Hexagonal", "description": "Ports & Adapters. Domain at the core, infrastructure on the outside."},
                 {"id": "clean", "label": "Clean Architecture", "description": "Uncle Bob's approach. Entities → Use Cases → Interface Adapters → Frameworks."},
-                {"id": "layered", "label": "Layered (N-Layer)", "description": "Traditional separation: Presentation, Business, Data Access layers."},
-                {"id": "ddd", "label": "Domain-Driven Design", "description": "Bounded contexts, aggregates, entities, and value objects."},
-                {"id": "cqrs", "label": "CQRS + Event Sourcing", "description": "Command Query Responsibility Segregation with event persistence."},
-                {"id": "modular", "label": "Modular Monolith", "description": "Single deployment unit with strict module boundaries and contracts."}
+                {"id": "layered", "label": "Layered (N-Layer)", "description": "Traditional separation: Presentation, Business, Data Access layers."}
             ]
         return [
             {"id": "mvc", "label": "MVC", "description": "Classic Model-View-Controller separation."},
             {"id": "hexagonal", "label": "Hexagonal", "description": "Ports & Adapters pattern for testability."},
-            {"id": "layered", "label": "Layered", "description": "N-Tier architecture with clear separation."},
-            {"id": "feature", "label": "Feature-First", "description": "Organize by features/modules instead of technical layers."},
-            {"id": "microkernel", "label": "Microkernel", "description": "Core system + plugins for extensibility."},
-            {"id": "event", "label": "Event-Driven", "description": "Loose coupling through events and message handlers."}
+            {"id": "layered", "label": "Layered", "description": "N-Tier architecture with clear separation."}
         ]
 
     async def warden_scan(self, project: str | None = None) -> dict:

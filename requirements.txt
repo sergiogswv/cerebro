@@ -6,3 +6,4 @@ pydantic-settings
 python-dotenv
 python-socketio
 psutil
+toml
