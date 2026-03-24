@@ -669,7 +669,7 @@ class Orchestrator:
         """
         Obtiene sugerencias de top 3 arquitecturas desde IA.
         """
-        from app.ai_utils import AIConfig, get_project_context, sugerir_top_3_arquitecturas
+        from app.ai_utils import AIConfig, get_project_context, sugerir_top_6_arquitecturas
 
         target_project = project_path or self.active_project
         if not target_project:
@@ -687,28 +687,50 @@ class Orchestrator:
         ai_configs = []
 
         logger.info(f"🔍 Buscando AI config en: {ai_config_path}")
+        logger.info(f"🔍 full_path: {full_path}")
+        logger.info(f"🔍 workspace_root: {self.workspace_root}")
+        logger.info(f"🔍 active_project: {self.active_project}")
         logger.info(f"🔍 ai_config_path exists: {os.path.exists(ai_config_path)}")
 
         if os.path.exists(ai_config_path):
             try:
                 with open(ai_config_path, "r", encoding="utf-8") as f:
-                    ai_config_data = json.load(f)
-                    logger.info(f"🔍 AI config data: {ai_config_data}")
-                    for cfg in ai_config_data.get("configs", []):
-                        ai_configs.append(AIConfig(
-                            name=cfg.get("name", "Unknown"),
-                            provider=cfg.get("provider", "Claude"),
-                            api_url=cfg.get("api_url", ""),
-                            api_key=cfg.get("api_key", ""),
-                            model=cfg.get("model", "")
-                        ))
+                    file_content = f.read()
+                    logger.info(f"🔍 AI config file content (first 500 chars): {file_content[:500]}")
+                    ai_config_data = json.loads(file_content)
+                    logger.info(f"🔍 AI config data parsed: {ai_config_data}")
+                    logger.info(f"🔍 AI config data type: {type(ai_config_data)}")
+
+                    configs_list = ai_config_data.get("configs", [])
+                    logger.info(f"🔍 configs_list: {configs_list} (type: {type(configs_list)})")
+
+                    for i, cfg in enumerate(configs_list):
+                        logger.info(f"🔍 Processing config {i}: {cfg}")
+                        if cfg and isinstance(cfg, dict):
+                            ai_configs.append(AIConfig(
+                                name=cfg.get("name", "Unknown"),
+                                provider=cfg.get("provider", "Claude"),
+                                api_url=cfg.get("api_url", ""),
+                                api_key=cfg.get("api_key", ""),
+                                model=cfg.get("model", "")
+                            ))
                     logger.info(f"🔍 Loaded {len(ai_configs)} AI configs")
             except Exception as e:
-                logger.error(f"Error cargando AI config: {e}")
+                logger.error(f"❌ Error cargando AI config: {e}")
+                logger.exception(e)  # Log full traceback
+        else:
+            logger.warning(f"⚠️ Archivo no encontrado: {ai_config_path}")
+            # Listar archivos en el directorio para debug
+            try:
+                files = os.listdir(full_path)
+                json_files = [f for f in files if f.endswith('.json')]
+                logger.info(f"🔍 Archivos JSON en {full_path}: {json_files}")
+            except Exception as e:
+                logger.error(f"❌ No se pudo listar directorio: {e}")
 
         if not ai_configs:
             # Retornar patrones por defecto si no hay IA configurada
-            logger.warning("⚠️ No hay AI configs, retornando patrones por defecto")
+            logger.warning("⚠️ No hay AI configs después de procesar, retornando patrones por defecto")
             return {"default": True, "patterns": self._get_default_patterns(full_path)}
 
         # Obtener contexto y sugerencias
@@ -716,20 +738,25 @@ class Orchestrator:
         framework = get_project_context(full_path)["framework"]
         logger.info(f"🧠 Framework detectado: {framework}")
 
-        logger.info(f"🧠 Llamando a sugerir_top_3_arquitecturas con framework={framework}, ai_configs={len(ai_configs)}")
-        top_3 = await sugerir_top_3_arquitecturas(framework, ai_configs)
-        logger.info(f"🧠 Resultado de sugerir_top_3_arquitecturas: {top_3}")
+        logger.info(f"🧠 Llamando a sugerir_top_6_arquitecturas con framework={framework}, ai_configs={len(ai_configs)}")
+        top_6 = await sugerir_top_6_arquitecturas(framework, ai_configs)
+        logger.info(f"🧠 Resultado de sugerir_top_6_arquitecturas: {top_6}")
 
-        if not top_3:
-            logger.warning("⚠️ sugerir_top_3_arquitecturas retornó None o vacío, usando patrones por defecto")
-            return {"default": True, "patterns": self._get_default_patterns(full_path)}
+        if not top_6:
+            # La IA está configurada pero falló la llamada - esto es un error real
+            logger.error("❌ La IA está configurada pero falló al generar sugerencias. Posibles causas: timeout, error HTTP, JSON inválido, o API key inválida.")
+            # Verificar si podemos obtener más detalles del error revisando logs
+            config_names = [cfg.name for cfg in ai_configs]
+            return {
+                "error": f"La IA ({', '.join(config_names)}) falló al generar sugerencias. Revisa: 1) Conexión a internet, 2) API key válida, 3) Modelo disponible, 4) Créditos suficientes."
+            }
 
         return {
             "ok": True,
             "framework": framework,
             "patterns": [
                 {"id": opt.name.lower().replace(" ", "-"), "label": opt.name, "description": opt.description}
-                for opt in top_3
+                for opt in top_6
             ]
         }
 

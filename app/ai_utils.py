@@ -401,23 +401,32 @@ def extraer_json_flexible(text: str) -> Optional[str]:
 
 # ─── Funciones principales de sugerencia ──────────────────────────────────────
 
-async def sugerir_top_3_arquitecturas(framework: str, ai_configs: List[AIConfig]) -> List[ArchOption]:
-    """Sugiere top 3 arquitecturas basadas en el framework"""
-    prompt = f"""Eres Arquitecto de Software. Framework: '{framework}'.
+async def sugerir_top_6_arquitecturas(framework: str, ai_configs: List[AIConfig]) -> List[ArchOption]:
+    """Sugiere top 6 arquitecturas basadas en el framework"""
+    prompt = f"""Eres Arquitecto de Software Senior. Framework: '{framework}'.
 
-Devuelve EXCLUSIVAMENTE JSON:
+Devuelve EXACTAMENTE 6 opciones de arquitectura ordenadas por relevancia para este framework.
+
+FORMATO JSON EXACTO:
 {{
   "options": [
-    {{"name": "Hexagonal", "description": "Ports & Adapters, domain-centric"}},
-    {{"name": "Clean Architecture", "description": "Uncle Bob's layers: Entities, UseCases, Interface"}},
-    {{"name": "Layered", "description": "N-Tier: Presentation, Business, Data Access"}}
+    {{"name": "Hexagonal", "description": "Ports & Adapters - domain logic isolated from external concerns"}},
+    {{"name": "Clean Architecture", "description": "Uncle Bob's layers: Entities → UseCases → Interface Adapters"}},
+    {{"name": "Layered (N-Tier)", "description": "Presentation → Business Logic → Data Access layers"}},
+    {{"name": "Feature-Based", "description": "Organize by features/modules, not by technical layers"}},
+    {{"name": "Vertical Slice", "description": "Features as vertical slices containing all layers"}},
+    {{"name": "Micro-frontends", "description": "Independent deployable frontend modules"}}
   ]
 }}
 
-Solo 3 opciones, sin texto extra."""
+IMPORTANTE:
+- Devuelve EXACTAMENTE 6 opciones
+- Elige las mejores para {framework}
+- Descripciones concisas (max 60 chars)
+- Solo JSON, sin texto extra"""
 
     response_text = await consultar_ia_con_fallback(prompt, ai_configs)
-    logger.info(f"Respuesta IA (top 3): {response_text[:500] if response_text else 'None'}...")
+    logger.info(f"Respuesta IA (top 6): {response_text[:500] if response_text else 'None'}...")
 
     if not response_text:
         return []
@@ -432,7 +441,7 @@ Solo 3 opciones, sin texto extra."""
         data = json.loads(json_str)
         options = data.get("options", [])
         logger.info(f"Options obtenidas: {len(options)}")
-        return [ArchOption(opt["name"], opt["description"]) for opt in options[:3]]
+        return [ArchOption(opt["name"], opt["description"]) for opt in options[:6]]
     except Exception as e:
         logger.error(f"Error parseando options: {e}")
         return []
