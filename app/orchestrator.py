@@ -82,20 +82,14 @@ class Orchestrator:
         return {"action": "notify_error", "delivered": sent}
 
     async def _handle_warning(self, event: AgentEvent) -> dict:
-        """WARNING: notificar y, si viene de sentinel, encadenar architect."""
+        """WARNING: notificar al usuario (sin encadenamiento automático)."""
         logger.warning(f"⚠️ WARNING desde {event.source}")
 
         actions = []
 
-        # Encadenamiento: cambio de archivo → análisis de lint
-        if event.source == "sentinel" and "file" in event.payload:
-            target_file = event.payload.get("file")
-            logger.info(f"🔗 Encadenando Architect sobre {target_file}")
-            ack = await send_command(
-                "architect",
-                OrchestratorCommand(action="lint", target=target_file)
-            )
-            actions.append({"action": "chain_architect", "ack": ack})
+        # NOTA: Ya NO encadenamos Architect automáticamente para file_change
+        # Sentinel hace el análisis IA directamente en modo monitor/serve
+        # El encadenamiento sería redundante y genera eventos duplicados
 
         message = self._build_message(event)
         sent = await notify(message, level="warning", source=event.source)
@@ -213,11 +207,21 @@ class Orchestrator:
             "sentinel",
             OrchestratorCommand(action="monitor", target=project_path)
         )
-        
-        # Si el monitor fue aceptado, registramos el éxito
+
+        # Si el monitor fue aceptado, registramos el éxito y emitimos sentinel_ready
         if ack.get("status") != "rejected":
             self.monitored_project = project_name
             logger.info(f"✅ Sentinel monitoreando exitosamente: {project_name}")
+
+            # Emitir sentinel_ready la primera vez que responde exitosamente
+            from app.sockets import emit_agent_event
+            await emit_agent_event({
+                "source": "sentinel",
+                "type": "sentinel_ready",
+                "severity": "info",
+                "payload": {"ready": True, "message": "Sentinel está listo para monitoreo"}
+            })
+            logger.info("✅ Sentinel ready emitido desde orchestrator")
         else:
             self.monitored_project = None
             logger.warning(f"⚠️ Sentinel no pudo iniciar monitoreo (posiblemente aún arrancando): {ack.get('error')}")
@@ -592,16 +596,16 @@ class Orchestrator:
 
     async def generate_ai_rules_for_pattern(self, pattern: str, project_path: str = None) -> dict:
         """
-        Genera reglas de arquitectura usando IA para un patrón dado.
-        Similar al flujo del CLI: detecta framework, obtiene contexto, consulta IA.
+        Genera reglas de arquitectura usando IA.
+        Delega a Architect (Rust) que es quien tiene la lógica de IA implementada.
         """
-        from app.ai_utils import (
-            AIConfig, get_project_context, sugerir_reglas_para_patron,
-            sugerir_top_3_arquitecturas, sugerir_arquitectura_inicial
-        )
+        import httpx
 
         target_project = project_path or self.active_project
+        logger.info(f"🔍 generate_ai_rules_for_pattern: pattern={pattern}, project_path={project_path}, active_project={self.active_project}")
+
         if not target_project:
+            logger.error("❌ No hay proyecto activo ni se especificó uno")
             return {"error": "No hay proyecto activo ni se especificó uno"}
 
         # Ruta completa del proyecto
@@ -610,66 +614,51 @@ class Orchestrator:
         else:
             full_path = os.path.join(self.workspace_root, target_project)
 
+        logger.info(f"🔍 Ruta completa del proyecto: {full_path}")
+
         if not os.path.exists(full_path):
+            logger.error(f"❌ Proyecto no encontrado: {full_path}")
             return {"error": f"Proyecto no encontrado: {full_path}"}
 
-        # Cargar configuración de IA del proyecto
+        # Cargar configuración de IA del proyecto para verificar que existe
         ai_config_path = os.path.join(full_path, ".architect.ai.json")
-        ai_configs = []
+        if not os.path.exists(ai_config_path):
+            logger.error(f"❌ AI config no existe: {ai_config_path}")
+            return {"error": "No hay configuración de IA (.architect.ai.json). Configura una en Architect Control Center."}
 
-        if os.path.exists(ai_config_path):
-            try:
-                with open(ai_config_path, "r", encoding="utf-8") as f:
-                    ai_config_data = json.load(f)
-                    for cfg in ai_config_data.get("configs", []):
-                        ai_configs.append(AIConfig(
-                            name=cfg.get("name", "Unknown"),
-                            provider=cfg.get("provider", "Claude"),
-                            api_url=cfg.get("api_url", ""),
-                            api_key=cfg.get("api_key", ""),
-                            model=cfg.get("model", "")
-                        ))
-            except Exception as e:
-                logger.error(f"Error cargando AI config: {e}")
-                return {"error": "No hay configuración de IA válida. Configura una en el Architect Control Center."}
-        else:
-            return {"error": "No hay configuración de IA (.architect.ai.json). Configura una en el Architect Control Center > AI Config."}
+        # Llamar a Architect vía HTTP
+        architect_url = settings.architect_url.rstrip('/')
+        params = {"project": full_path}
+        if pattern:
+            params["pattern"] = pattern
 
-        if not ai_configs:
-            return {"error": "No hay proveedores de IA configurados. Agrega al menos uno en AI Config."}
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                logger.info(f"🔍 Llamando a Architect: {architect_url}/ai/rules?{params}")
+                resp = await client.get(f"{architect_url}/ai/rules", params=params)
+                resp.raise_for_status()
+                result = resp.json()
 
-        # Obtener contexto del proyecto
-        context = get_project_context(full_path)
-        logger.info(f"🔍 Contexto del proyecto: framework={context['framework']}, deps={len(context['dependencies'])}, folders={len(context['folder_structure'])}")
-
-        # Si no se especificó patrón, hacer análisis automático
-        if not pattern:
-            logger.info("🧠 Realizando análisis automático de arquitectura con IA...")
-            result = await sugerir_arquitectura_inicial(context, ai_configs)
-            if not result:
-                return {"error": "No se pudo obtener una respuesta de la IA. Verifica la configuración de IA."}
-        else:
-            # Generar reglas para el patrón específico
-            logger.info(f"🧠 Generando reglas para patrón '{pattern}' con IA...")
-            result = await sugerir_reglas_para_patron(pattern, context, ai_configs)
-            if not result:
-                return {"error": "No se pudo obtener una respuesta de la IA. Verifica la configuración de IA."}
-
-        logger.info(f"✅ IA generó {len(result.rules)} reglas para el patrón '{result.pattern}'")
-
-        # Retornar reglas en formato serializable
-        return {
-            "ok": True,
-            "pattern": result.pattern,
-            "suggested_max_lines": result.suggested_max_lines,
-            "rules": [r.to_dict() for r in result.rules]
-        }
+                if result.get("ok"):
+                    logger.info(f"✅ Architect generó {len(result.get('rules', []))} reglas")
+                    return result
+                else:
+                    error_msg = result.get("error", "Error desconocido de Architect")
+                    logger.error(f"❌ Architect retornó error: {error_msg}")
+                    return {"error": error_msg}
+        except httpx.TimeoutException:
+            logger.error("⏰ Timeout consultando a Architect")
+            return {"error": "Timeout: Architect tardó más de 120s en responder"}
+        except Exception as e:
+            logger.exception(f"❌ Error llamando a Architect: {e}")
+            return {"error": f"Error comunicando con Architect: {str(e)}"}
 
     async def get_ai_architecture_suggestions(self, project_path: str = None) -> dict:
         """
-        Obtiene sugerencias de top 3 arquitecturas desde IA.
+        Obtiene sugerencias de arquitecturas desde IA.
+        Delega a Architect (Rust) que es quien tiene la lógica de IA implementada.
         """
-        from app.ai_utils import AIConfig, get_project_context, sugerir_top_6_arquitecturas
+        import httpx
 
         target_project = project_path or self.active_project
         if not target_project:
@@ -682,83 +671,35 @@ class Orchestrator:
         if not os.path.exists(full_path):
             return {"error": f"Proyecto no encontrado: {full_path}"}
 
-        # Cargar configuración de IA
+        # Verificar que existe AI config
         ai_config_path = os.path.join(full_path, ".architect.ai.json")
-        ai_configs = []
-
-        logger.info(f"🔍 Buscando AI config en: {ai_config_path}")
-        logger.info(f"🔍 full_path: {full_path}")
-        logger.info(f"🔍 workspace_root: {self.workspace_root}")
-        logger.info(f"🔍 active_project: {self.active_project}")
-        logger.info(f"🔍 ai_config_path exists: {os.path.exists(ai_config_path)}")
-
-        if os.path.exists(ai_config_path):
-            try:
-                with open(ai_config_path, "r", encoding="utf-8") as f:
-                    file_content = f.read()
-                    logger.info(f"🔍 AI config file content (first 500 chars): {file_content[:500]}")
-                    ai_config_data = json.loads(file_content)
-                    logger.info(f"🔍 AI config data parsed: {ai_config_data}")
-                    logger.info(f"🔍 AI config data type: {type(ai_config_data)}")
-
-                    configs_list = ai_config_data.get("configs", [])
-                    logger.info(f"🔍 configs_list: {configs_list} (type: {type(configs_list)})")
-
-                    for i, cfg in enumerate(configs_list):
-                        logger.info(f"🔍 Processing config {i}: {cfg}")
-                        if cfg and isinstance(cfg, dict):
-                            ai_configs.append(AIConfig(
-                                name=cfg.get("name", "Unknown"),
-                                provider=cfg.get("provider", "Claude"),
-                                api_url=cfg.get("api_url", ""),
-                                api_key=cfg.get("api_key", ""),
-                                model=cfg.get("model", "")
-                            ))
-                    logger.info(f"🔍 Loaded {len(ai_configs)} AI configs")
-            except Exception as e:
-                logger.error(f"❌ Error cargando AI config: {e}")
-                logger.exception(e)  # Log full traceback
-        else:
-            logger.warning(f"⚠️ Archivo no encontrado: {ai_config_path}")
-            # Listar archivos en el directorio para debug
-            try:
-                files = os.listdir(full_path)
-                json_files = [f for f in files if f.endswith('.json')]
-                logger.info(f"🔍 Archivos JSON en {full_path}: {json_files}")
-            except Exception as e:
-                logger.error(f"❌ No se pudo listar directorio: {e}")
-
-        if not ai_configs:
-            # No hay IA configurada - devolver error para que el frontend pregunte
-            logger.warning("⚠️ No hay AI configs después de procesar")
+        if not os.path.exists(ai_config_path):
             return {"error": "No hay configuración de IA. Configura un proveedor en AI Config primero."}
 
-        # Obtener contexto y sugerencias
-        logger.info(f"🧠 Obteniendo contexto del proyecto: {full_path}")
-        framework = get_project_context(full_path)["framework"]
-        logger.info(f"🧠 Framework detectado: {framework}")
+        # Llamar a Architect vía HTTP
+        architect_url = settings.architect_url.rstrip('/')
+        params = {"project": full_path}
 
-        logger.info(f"🧠 Llamando a sugerir_top_6_arquitecturas con framework={framework}, ai_configs={len(ai_configs)}")
-        top_6 = await sugerir_top_6_arquitecturas(framework, ai_configs)
-        logger.info(f"🧠 Resultado de sugerir_top_6_arquitecturas: {top_6}")
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                logger.info(f"🔍 Llamando a Architect: {architect_url}/ai/suggestions?{params}")
+                resp = await client.get(f"{architect_url}/ai/suggestions", params=params)
+                resp.raise_for_status()
+                result = resp.json()
 
-        if not top_6:
-            # La IA está configurada pero falló la llamada - esto es un error real
-            logger.error("❌ La IA está configurada pero falló al generar sugerencias. Posibles causas: timeout, error HTTP, JSON inválido, o API key inválida.")
-            # Verificar si podemos obtener más detalles del error revisando logs
-            config_names = [cfg.name for cfg in ai_configs]
-            return {
-                "error": f"La IA ({', '.join(config_names)}) falló al generar sugerencias. Revisa: 1) Conexión a internet, 2) API key válida, 3) Modelo disponible, 4) Créditos suficientes."
-            }
-
-        return {
-            "ok": True,
-            "framework": framework,
-            "patterns": [
-                {"id": opt.name.lower().replace(" ", "-"), "label": opt.name, "description": opt.description}
-                for opt in top_6
-            ]
-        }
+                if result.get("ok"):
+                    logger.info(f"✅ Architect retornó {len(result.get('patterns', []))} sugerencias")
+                    return result
+                else:
+                    error_msg = result.get("error", "Error desconocido de Architect")
+                    logger.error(f"❌ Architect retornó error: {error_msg}")
+                    return {"error": error_msg}
+        except httpx.TimeoutException:
+            logger.error("⏰ Timeout consultando a Architect")
+            return {"error": "Timeout: Architect tardó más de 120s en responder"}
+        except Exception as e:
+            logger.exception(f"❌ Error llamando a Architect: {e}")
+            return {"error": f"Error comunicando con Architect: {str(e)}"}
 
     def _get_default_patterns(self, project_path: str) -> list:
         """Retorna 3 patrones por defecto si no hay IA disponible"""

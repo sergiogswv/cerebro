@@ -179,10 +179,18 @@ async def get_ai_rules(pattern: str = None, project: str = None):
     Genera reglas de arquitectura usando IA para un patrón específico.
     Si no se especifica patrón, realiza análisis automático.
     """
-    result = await orchestrator.generate_ai_rules_for_pattern(pattern, project)
-    if isinstance(result, dict) and "error" in result:
-        return ApiResponse(ok=False, message=result["error"])
-    return ApiResponse(ok=True, data=result)
+    import traceback
+    logger.info(f"🔍 /architect/ai-rules endpoint: pattern={pattern}, project={project}, active_project={orchestrator.active_project}")
+    try:
+        result = await orchestrator.generate_ai_rules_for_pattern(pattern, project)
+        logger.info(f"🔍 /architect/ai-rules result: {result}")
+        if isinstance(result, dict) and "error" in result:
+            logger.error(f"❌ Error en ai-rules: {result['error']}")
+            return ApiResponse(ok=False, message=result["error"])
+        return ApiResponse(ok=True, data=result)
+    except Exception as e:
+        logger.exception(f"❌ Excepción en ai-rules: {e}")
+        raise
 
 
 @router.get("/architect/ai-suggestions", response_model=ApiResponse, summary="Obtener sugerencias de arquitecturas desde IA")
@@ -196,6 +204,13 @@ async def get_ai_suggestions(project: str = None):
         return ApiResponse(ok=False, message=result["error"])
     return ApiResponse(ok=True, data=result)
 
+
+# Estado para trackear qué agentes están ready
+_agent_ready_status = {
+    "architect": False,
+    "sentinel": False,
+    "warden": False,
+}
 
 @router.post("/architect/command", response_model=ApiResponse, summary="Enviar comando a Architect")
 async def architect_command(request: Request):
@@ -224,6 +239,17 @@ async def architect_command(request: Request):
     ack = await send_raw_command("architect", command)
     if isinstance(ack, dict) and ack.get("status") == "rejected":
         return ApiResponse(ok=False, message=ack.get("error", "Comando rechazado"))
+
+    # Emitir architect_ready la primera vez que responde exitosamente
+    if not _agent_ready_status["architect"]:
+        _agent_ready_status["architect"] = True
+        await emit_agent_event({
+            "source": "architect",
+            "type": "architect_ready",
+            "severity": "info",
+            "payload": {"ready": True, "message": "Architect está listo para análisis"}
+        })
+        logger.info("✅ Architect ready emitido")
 
     # Mensajes descriptivos para cada acción
     action_messages = {
@@ -318,6 +344,17 @@ async def sentinel_command(request: Request):
     if isinstance(ack, dict) and ack.get("status") == "rejected":
         return ApiResponse(ok=False, message=ack.get("error", "Comando rechazado"))
 
+    # Emitir sentinel_ready la primera vez que responde exitosamente
+    if not _agent_ready_status["sentinel"]:
+        _agent_ready_status["sentinel"] = True
+        await emit_agent_event({
+            "source": "sentinel",
+            "type": "sentinel_ready",
+            "severity": "info",
+            "payload": {"ready": True, "message": "Sentinel está listo para monitoreo"}
+        })
+        logger.info("✅ Sentinel ready emitido")
+
     # Mensajes descriptivos para cada acción Pro
     action_messages = {
         "check": "🔍 Quick Check: Análisis estático rápido en progreso...",
@@ -337,6 +374,10 @@ async def sentinel_command(request: Request):
         elif ack_status in ["accepted", "completed"]:
             result_status = "completed"
 
+    # Determinar si es análisis de archivo o proyecto completo
+    is_file_analysis = target and not target.endswith('/') and '.' in target.split('/')[-1]
+    scope = "file" if is_file_analysis else "project"
+
     # Emitir evento para que el Dashboard lo muestre
     # Tipo: pro_check, pro_audit, pro_report, etc.
     event_type = f"pro_{subcommand.replace('-', '_')}"
@@ -347,6 +388,7 @@ async def sentinel_command(request: Request):
         "payload": {
             "action": subcommand,
             "target": target,
+            "scope": scope,
             "status": result_status,
             "message": action_messages.get(subcommand, f"🚀 Ejecutando acción Pro: {subcommand}"),
             "result": ack.get("result") if isinstance(ack, dict) else None
@@ -396,10 +438,21 @@ async def sentinel_monitor_pause(request: Request):
 async def sentinel_monitor_daily_report(request: Request):
     """Genera reporte diario de productividad basado en commits de Git"""
     from app.sockets import emit_agent_event
+    from fastapi import HTTPException
     import uuid
+    import os
+
+    # Validar proyecto activo
+    if not orchestrator.active_project:
+        raise HTTPException(status_code=400, detail="No hay proyecto activo seleccionado")
 
     data = await request.json() if await request.body() else {}
-    target = data.get("target", orchestrator.active_project)
+
+    # Convertir nombre del proyecto a ruta completa
+    project_name = data.get("target", orchestrator.active_project)
+    target = "."
+    if project_name and project_name != "Ninguno":
+        target = os.path.join(orchestrator.workspace_root, project_name).replace("\\", "/")
 
     command = {
         "action": "monitor/daily-report",
@@ -408,14 +461,18 @@ async def sentinel_monitor_daily_report(request: Request):
     }
 
     from app.dispatcher import send_raw_command
-    ack = await send_raw_command("sentinel", command)
+    try:
+        ack = await send_raw_command("sentinel", command)
+    except Exception as e:
+        ack = {"status": "error", "error": str(e)}
 
+    # Emitir evento siempre (independientemente del resultado)
     await emit_agent_event({
         "source": "sentinel",
         "type": "daily_report",
         "severity": "info",
         "payload": {
-            "message": "Generando reporte diario de productividad...",
+            "message": "Reporte diario de productividad generado",
             "result": ack
         }
     })
@@ -453,10 +510,16 @@ async def sentinel_monitor_metrics():
 async def sentinel_monitor_testing(request: Request):
     """Obtiene sugerencias de testing complementarias para el proyecto activo"""
     from app.sockets import emit_agent_event
+    from fastapi import HTTPException
     import uuid
     import logging
+    import os
 
     logger = logging.getLogger(__name__)
+
+    # Validar proyecto activo
+    if not orchestrator.active_project:
+        raise HTTPException(status_code=400, detail="No hay proyecto activo seleccionado")
 
     try:
         data = await request.json() if await request.body() else {}
@@ -464,7 +527,11 @@ async def sentinel_monitor_testing(request: Request):
         logger.warning(f"Error leyendo request body: {e}")
         data = {}
 
-    target = data.get("target", orchestrator.active_project)
+    # Convertir nombre del proyecto a ruta completa
+    project_name = data.get("target", orchestrator.active_project)
+    target = "."
+    if project_name and project_name != "Ninguno":
+        target = os.path.join(orchestrator.workspace_root, project_name).replace("\\", "/")
 
     logger.info(f"🎯 Target: {target}, Active project: {orchestrator.active_project}")
 
@@ -479,32 +546,35 @@ async def sentinel_monitor_testing(request: Request):
     from app.dispatcher import send_raw_command
     try:
         ack = await send_raw_command("sentinel", command)
+        logger.info(f"📥 Respuesta de Sentinel: {ack}")
     except Exception as e:
         logger.error(f"❌ Error ejecutando comando: {e}")
         ack = {"status": "error", "error": str(e)}
 
-    logger.info(f"📥 Respuesta de Sentinel: {ack}")
+    # Extraer mensaje de forma segura
+    message = "Sugerencias de testing generadas"
+    if isinstance(ack, dict):
+        result = ack.get("result")
+        if isinstance(result, dict):
+            message = result.get("message", message)
 
-    # Solo emitir evento si hay resultado exitoso
-    if isinstance(ack, dict) and ack.get("status") in ["completed", "accepted"]:
-        event_payload = {
-            "source": "sentinel",
-            "type": "testing_suggestions",
-            "severity": "info",
-            "payload": {
-                "message": ack.get("result", {}).get("message", "Sugerencias de testing generadas"),
-                "result": ack
-            }
+    # Emitir evento siempre (independientemente del resultado)
+    event_payload = {
+        "source": "sentinel",
+        "type": "testing_suggestions",
+        "severity": "info",
+        "payload": {
+            "message": message,
+            "result": ack
         }
+    }
 
-        logger.info(f"📤 Emitiendo evento: {event_payload}")
-        try:
-            await emit_agent_event(event_payload)
-            logger.info("✅ Evento emitido exitosamente")
-        except Exception as e:
-            logger.error(f"❌ Error emitiendo evento: {e}")
-    else:
-        logger.error(f"❌ Error en comando testing: {ack}")
+    logger.info(f"📤 Emitiendo evento: {event_payload}")
+    try:
+        await emit_agent_event(event_payload)
+        logger.info("✅ Evento emitido exitosamente")
+    except Exception as e:
+        logger.error(f"❌ Error emitiendo evento: {e}")
 
     return ApiResponse(ok=True, message="Sugerencias de testing solicitadas", data=ack)
 

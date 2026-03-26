@@ -1,8 +1,9 @@
 import logging
 import logging.config
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from app.config import get_settings
 from app.routes import router
 
@@ -66,6 +67,10 @@ async def lifespan(app: FastAPI):
     logger.info("🧠 Cerebro apagado")
 
 
+# Import socketio primero
+import socketio
+from app.sockets import sio
+
 app = FastAPI(
     title="Cerebro — Orquestador",
     description="Orquestador central del sistema multi-agente de desarrollo.",
@@ -73,6 +78,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS middleware - debe estar ANTES de incluir routers y Socket.IO
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -82,10 +88,14 @@ app.add_middleware(
 
 app.include_router(router)
 
-import socketio
-from app.sockets import sio
-
-
+# Global exception handler - log full traceback before returning 500
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"❌ Unhandled exception in {request.method} {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {str(exc)}"}
+    )
 
 @app.get("/", tags=["root"])
 async def root():
@@ -96,4 +106,5 @@ async def root():
         "docs": "/docs",
     }
 
+# Socket.IO ASGIApp debe envolver la app con CORS ya configurada
 app = socketio.ASGIApp(sio, other_asgi_app=app, socketio_path='/ws/socket.io')

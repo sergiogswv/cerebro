@@ -1,5 +1,7 @@
 import socketio
 import logging
+import uuid
+from datetime import datetime
 
 logger = logging.getLogger("cerebro.sockets")
 
@@ -50,14 +52,25 @@ async def disconnect(sid):
 async def emit_agent_event(event_data: dict):
     """
     Emite un evento de agente a todos los clientes conectados.
+    Agrega timestamp e ID único para que el dashboard los renderice.
     Guarda eventos de interacción pendientes para clientes futuros.
     También guarda el estado de readiness de los agentes.
     """
     try:
+        # Agregar timestamp e ID único para cada evento
+        event_with_metadata = {
+            **event_data,
+            'id': str(uuid.uuid4()),
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        }
+
         # Guardar eventos de interacción para clientes que se conecten después
         if event_data.get('type') == 'interaction_required':
-            pending_interaction_events.append(event_data)
+            pending_interaction_events.append(event_with_metadata)
             logger.info(f"💾 Evento de interacción guardado (pendientes: {len(pending_interaction_events)})")
+        else:
+            # Para eventos normales, emitimos con metadata
+            event_data = event_with_metadata
 
         # Guardar estado de readiness de los agentes
         if event_data.get('type') in ['sentinel_ready', 'architect_ready', 'warden_ready']:
