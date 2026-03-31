@@ -702,3 +702,323 @@ async def warden_churn_report():
     })
 
     return ApiResponse(ok=True, message="Reporte de churn generado", data=result)
+
+
+@router.get("/warden/config", response_model=ApiResponse, summary="Obtener configuración del Warden Agent")
+async def get_warden_config():
+    """
+    Retorna la configuración actual de Warden:
+      - warden_mode ('core' | 'adk')
+      - warden_url, warden_adk_url, active_url (URL que se usará)
+      - warden_llm_provider (gemini | claude | openai)
+    """
+    from app.config import get_settings
+    s = get_settings()
+    return ApiResponse(ok=True, data={
+        "warden_mode":          s.warden_mode,
+        "warden_url":           s.warden_url,
+        "warden_adk_url":       s.warden_adk_url,
+        "active_url":           s.warden_adk_url if s.warden_mode == "adk" else s.warden_url,
+        "warden_llm_provider":  s.warden_llm_provider,
+    })
+
+
+@router.post("/warden/config", response_model=ApiResponse, summary="Actualizar modo Warden (core | adk)")
+async def save_warden_config(request: Request):
+    """
+    Persiste WARDEN_MODE y opcionalmente WARDEN_LLM_PROVIDER en el .env de Cerebro.
+    El cambio se aplica al reiniciar Cerebro.
+    Emite un WebSocket event para que el Dashboard actualice el badge de modo.
+    """
+    import re
+    from pathlib import Path
+
+    data         = await request.json()
+    new_mode     = data.get("warden_mode")
+    new_provider = data.get("warden_llm_provider")
+
+    if new_mode not in ("core", "adk"):
+        raise HTTPException(status_code=400, detail="warden_mode debe ser 'core' o 'adk'")
+
+    env_path = Path(__file__).parent.parent / ".env"
+    env_text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+
+    def _upsert(text: str, key: str, value: str) -> str:
+        if re.search(rf"^{key}=", text, re.MULTILINE):
+            return re.sub(rf"^{key}=.*$", f"{key}={value}", text, flags=re.MULTILINE)
+        return text + f"\n{key}={value}"
+
+    env_text = _upsert(env_text, "WARDEN_MODE", new_mode)
+    if new_provider:
+        env_text = _upsert(env_text, "WARDEN_LLM_PROVIDER", new_provider)
+    env_path.write_text(env_text, encoding="utf-8")
+
+    from app.sockets import emit_agent_event
+    await emit_agent_event({
+        "source": "warden", "type": "config_updated", "severity": "info",
+        "payload": {
+            "warden_mode": new_mode, "warden_llm_provider": new_provider,
+            "message": f"Warden → modo '{new_mode}'. Reinicia Cerebro para aplicar.",
+        }
+    })
+    return ApiResponse(ok=True,
+                       message=f"Guardado. Reinicia Cerebro para activar modo '{new_mode}'.",
+                       data={"warden_mode": new_mode})
+
+
+@router.get("/warden/memory", response_model=ApiResponse, summary="Historial de memoria del Warden ADK")
+async def get_warden_memory():
+    """
+    Proxy a /memory/context del sidecar Warden ADK.
+    Retorna hot_files + recent_findings.
+    Solo disponible cuando warden_mode = 'adk'.
+    """
+    import httpx
+    from app.config import get_settings
+    s = get_settings()
+
+    if s.warden_mode != "adk":
+        return ApiResponse(ok=False,
+                           message="El modo actual es 'core'. Activa 'adk' para ver el historial de memoria.")
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{s.warden_adk_url}/memory/context")
+            resp.raise_for_status()
+            return ApiResponse(ok=True, data=resp.json())
+    except httpx.ConnectError:
+        return ApiResponse(ok=False, message=f"Sidecar ADK no disponible en {s.warden_adk_url}")
+    except Exception as exc:
+        return ApiResponse(ok=False, message=str(exc))
+
+
+@router.post("/warden/command", response_model=ApiResponse, summary="Enviar comando genérico a Warden")
+async def warden_generic_command(request: Request):
+    """
+    Endpoint genérico que el Dashboard puede usar para disparar cualquier acción.
+    Compatible con modo core y adk (mismo contrato /command).
+    En modo ADK, el resultado incluye { analysis } con la síntesis del LLM.
+    Emite eventos WebSocket de inicio y fin para visualización en tiempo real.
+    """
+    from app.sockets import emit_agent_event
+    from app.dispatcher import send_raw_command
+    import uuid, os
+
+    data   = await request.json()
+    action = data.get("action", "scan")
+    target = data.get("target", orchestrator.active_project)
+
+    project_path = "."
+    if target and target != "Ninguno":
+        project_path = os.path.join(orchestrator.workspace_root, target).replace("\\", "/")
+
+    await emit_agent_event({
+        "source": "warden",
+        "type":   f"warden_{action.replace('-', '_')}_started",
+        "severity": "info",
+        "payload": {"action": action, "target": target,
+                    "message": f"⏳ Warden ejecutando '{action}'..."},
+    })
+
+    ack = await send_raw_command("warden", {
+        "action": action, "target": project_path,
+        "request_id": f"warden-{str(uuid.uuid4())[:8]}",
+    })
+
+    result_obj = ack.get("result") if isinstance(ack, dict) else {}
+    analysis   = result_obj.get("analysis") if isinstance(result_obj, dict) else None
+    severity   = result_obj.get("severity", "info") if isinstance(result_obj, dict) else "info"
+
+    await emit_agent_event({
+        "source": "warden",
+        "type":   f"warden_{action.replace('-', '_')}_completed",
+        "severity": severity,
+        "payload": {
+            "action": action, "target": target,
+            "status": ack.get("status") if isinstance(ack, dict) else "error",
+            "analysis": analysis,
+            "message": analysis[:200] if analysis else f"✅ Warden '{action}' completado",
+        },
+    })
+
+    if isinstance(ack, dict) and ack.get("status") == "rejected":
+        return ApiResponse(ok=False, message=ack.get("error", "Warden rechazó el comando"))
+
+    return ApiResponse(ok=True, message=f"Warden '{action}' ejecutado", data=ack)
+
+
+# ─── Feedback & Learning Endpoints ────────────────────────────────────────────
+
+@router.post("/feedback", response_model=ApiResponse, summary="Registrar feedback de usuario sobre decisión de Cerebro")
+async def submit_feedback(request: Request):
+    """
+    Registra feedback del usuario (thumbs_up/thumbs_down) sobre una decisión de Cerebro.
+    """
+    from app.context_db import get_context_db
+
+    body = await request.json()
+    event_id = body.get("event_id")
+    feedback_type = body.get("feedback_type")  # 'thumbs_up' o 'thumbs_down'
+    reason = body.get("reason")
+    suggested_action = body.get("suggested_action")
+
+    if not event_id or not feedback_type:
+        raise HTTPException(status_code=400, detail="event_id y feedback_type son requeridos")
+
+    context_db = get_context_db()
+    feedback_id = context_db.record_feedback(
+        event_id=event_id,
+        feedback_type=feedback_type,
+        reason=reason,
+        suggested_action=suggested_action,
+    )
+
+    return ApiResponse(ok=True, message="Feedback registrado", data={"feedback_id": feedback_id})
+
+
+@router.get("/learn", response_model=ApiResponse, summary="Analizar feedback y sugerir ajustes de reglas")
+async def get_learning_suggestions(limit: int = 100):
+    """
+    Analiza los últimos eventos y feedback para sugerir ajustes de reglas.
+    """
+    from app.context_db import get_context_db
+
+    context_db = get_context_db()
+    analysis = context_db.analyze_learning(limit=limit)
+
+    return ApiResponse(ok=True, data=analysis)
+
+
+@router.get("/feedback/stats", response_model=ApiResponse, summary="Obtener estadísticas de feedback")
+async def get_feedback_stats(event_id: str = None):
+    """
+    Obtiene estadísticas de feedback (thumbs_up, thumbs_down, accuracy).
+    """
+    from app.context_db import get_context_db
+
+    context_db = get_context_db()
+    stats = context_db.get_feedback_stats(event_id=event_id)
+
+    return ApiResponse(ok=True, data=stats)
+
+
+@router.get("/learned-rules", response_model=ApiResponse, summary="Obtener reglas aprendidas")
+async def get_learned_rules(active_only: bool = True):
+    """
+    Obtiene reglas aprendidas basadas en feedback acumulado.
+    """
+    from app.context_db import get_context_db
+
+    context_db = get_context_db()
+    rules = context_db.get_learned_rules(active_only=active_only)
+
+    return ApiResponse(ok=True, data=rules)
+
+
+# ─── Change Management Endpoints ──────────────────────────────────────────────
+
+@router.get("/changes/pending", response_model=ApiResponse, summary="Obtener cambios pendientes de aprobación")
+async def get_pending_changes():
+    """
+    Retorna lista de cambios críticos pendientes de aprobación humana.
+    """
+    from app.change_manager import get_change_manager
+
+    change_manager = get_change_manager()
+    changes = change_manager.get_pending_changes()
+
+    return ApiResponse(ok=True, data={"changes": changes, "count": len(changes)})
+
+
+@router.get("/changes/approved-batch", response_model=ApiResponse, summary="Obtener cambios aprobados listos para aplicar")
+async def get_approved_batch():
+    """
+    Retorna lista de cambios aprobados pendientes de aplicación.
+    """
+    from app.change_manager import get_change_manager
+
+    change_manager = get_change_manager()
+    changes = change_manager.get_approved_batch()
+
+    return ApiResponse(ok=True, data={"changes": changes, "count": len(changes)})
+
+
+@router.post("/changes/approve", response_model=ApiResponse, summary="Aprobar cambio(s) pendiente(s)")
+async def approve_change(request: Request):
+    """
+    Aprueba un cambio individual o todos los pendientes.
+    Body: {"change_id": "abc123"} o {"approve_all": true}
+    """
+    from app.change_manager import get_change_manager
+
+    body = await request.json()
+    change_manager = get_change_manager()
+
+    if body.get("approve_all"):
+        count = await change_manager.approve_all_pending()
+        return ApiResponse(ok=True, message=f"{count} cambios aprobados")
+
+    change_id = body.get("change_id")
+    if not change_id:
+        raise HTTPException(status_code=400, detail="change_id requerido")
+
+    success = await change_manager.approve_change(change_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Cambio no encontrado")
+
+    return ApiResponse(ok=True, message="Cambio aprobado")
+
+
+@router.post("/changes/reject", response_model=ApiResponse, summary="Rechazar cambio(s) pendiente(s)")
+async def reject_change(request: Request):
+    """
+    Rechaza un cambio individual o todos los pendientes.
+    Body: {"change_id": "abc123"} o {"reject_all": true}
+    """
+    from app.change_manager import get_change_manager
+
+    body = await request.json()
+    change_manager = get_change_manager()
+
+    if body.get("reject_all"):
+        count = await change_manager.reject_all_pending()
+        return ApiResponse(ok=True, message=f"{count} cambios rechazados")
+
+    change_id = body.get("change_id")
+    if not change_id:
+        raise HTTPException(status_code=400, detail="change_id requerido")
+
+    success = await change_manager.reject_change(change_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Cambio no encontrado")
+
+    return ApiResponse(ok=True, message="Cambio rechazado")
+
+
+@router.post("/changes/apply", response_model=ApiResponse, summary="Aplicar cambios aprobados")
+async def apply_changes(request: Request):
+    """
+    Aplica el batch de cambios aprobados.
+    Pausa Sentinel → aplica cambios → reactiva Sentinel.
+    """
+    from app.change_manager import get_change_manager
+
+    change_manager = get_change_manager()
+    result = await change_manager.apply_approved_changes()
+
+    if result.get("status") == "failed":
+        return ApiResponse(ok=False, message=result.get("error"))
+
+    return ApiResponse(ok=True, message="Cambios aplicados", data=result)
+
+
+@router.get("/changes/stats", response_model=ApiResponse, summary="Obtener estadísticas de ChangeManager")
+async def get_change_stats():
+    """
+    Retorna estadísticas del ChangeManager.
+    """
+    from app.change_manager import get_change_manager
+
+    change_manager = get_change_manager()
+    stats = change_manager.get_stats()
+
+    return ApiResponse(ok=True, data=stats)

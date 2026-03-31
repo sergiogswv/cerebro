@@ -1,0 +1,14 @@
+{
+    "auto_fix_enabled": true,
+    "auto_fix_provider": "ollama",
+    "auto_fix_model": "qwen3:8b",
+    "require_approval_critical": true,
+    "isolation_branch_prefix": "skrymir-fix/",
+    "notifier_timeout_mins": 30,
+    "chain_fallback_behavior": "branch_and_wait",
+    "auto_fix_max_retries": 3,
+    "warden_mode": "adk",
+    "warden_adk_url": "http://127.0.0.1:4013",
+    "architect_mode": "adk",
+    "architect_adk_url": "http://127.0.0.1:4012"
+}

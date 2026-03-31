@@ -7,12 +7,29 @@ from app.config import get_settings
 logger = logging.getLogger("cerebro.dispatcher")
 settings = get_settings()
 
-# Mapa de agentes a sus URLs
+# Mapa de agentes a sus URLs.
+# Warden se resuelve en runtime según warden_mode:
+#   "core" → Rust Core :4003  (rápido, determinista, sin IA)
+#   "adk"  → Sidecar Python :4013  (LLM + memoria persistente)
+def _resolve_warden_url() -> str:
+    if settings.warden_mode == "adk":
+        logger.info(f"🔱 Warden en modo ADK → {settings.warden_adk_url}")
+        return settings.warden_adk_url
+    return settings.warden_url
+
+
+def _resolve_architect_url() -> str:
+    if settings.architect_mode == "adk":
+        logger.info(f"🏛️ Architect en modo ADK → {settings.architect_adk_url}")
+        return settings.architect_adk_url
+    return settings.architect_url
+
+
 AGENT_URLS: dict[str, str] = {
-    "sentinel": settings.sentinel_url,
-    "architect": settings.architect_url,
-    "warden": settings.warden_url,
-    "ejecutor": settings.executor_url,
+    "sentinel":  settings.sentinel_url,
+    "architect": _resolve_architect_url(),
+    "warden":    _resolve_warden_url(),
+    "ejecutor":  settings.executor_url,
 }
 
 
@@ -33,7 +50,7 @@ async def send_command(agent: str, command: OrchestratorCommand, max_retries: in
     last_error = None
     for attempt in range(max_retries):
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=300.0) as client:
                 logger.info(f"→ [{agent.upper()}] {command.action} | request_id={command.request_id} (intento {attempt + 1}/{max_retries})")
                 response = await client.post(endpoint, json=payload)
                 response.raise_for_status()
