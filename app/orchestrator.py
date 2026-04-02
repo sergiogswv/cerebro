@@ -7,6 +7,7 @@ from app.dispatcher import send_command, notify
 from app.decision_engine import DecisionEngine, DecisionAction
 from app.context_db import ContextDB, get_context_db
 from app.change_manager import ChangeManager, get_change_manager
+from app.config_manager import UnifiedConfigManager
 
 logger = logging.getLogger("cerebro.orchestrator")
 
@@ -130,7 +131,7 @@ class Orchestrator:
     async def _handle_warning(self, event: AgentEvent) -> dict:
         """
         WARNING: notificar al usuario.
-        Si es análisis de Sentinel, procesar violaciones como cambios pendientes.
+        Si es análisis de Sentinel o Architect, procesar violaciones como cambios pendientes.
         """
         logger.warning(f"⚠️ WARNING desde {event.source} - type={event.type}")
 
@@ -139,6 +140,20 @@ class Orchestrator:
             logger.info("🔍 Procesando análisis de Sentinel (warning)...")
             result = await self._process_sentinel_analysis(event)
             logger.info(f"✅ Análisis procesado: {result}")
+            return result
+
+        # Si es análisis de Architect con hallazgos, procesarlos
+        if event.source == "architect" and event.type in ("architect_lint_completed", "architect_analyze_completed"):
+            logger.info("🏛️ Procesando análisis de Architect (warning)...")
+            result = await self._process_architect_analysis(event)
+            logger.info(f"✅ Análisis de Architect procesado: {result}")
+            return result
+
+        # Si es análisis de Warden con hallazgos, procesarlos
+        if event.source == "warden" and event.type.startswith("warden_"):
+            logger.info("🔱 Procesando análisis de Warden (warning)...")
+            result = await self._process_warden_analysis(event)
+            logger.info(f"✅ Análisis de Warden procesado: {result}")
             return result
 
         actions = []
@@ -163,6 +178,16 @@ class Orchestrator:
         # Si es análisis de Sentinel con resultados, extraer violaciones
         if event.source == "sentinel" and event.type == "analysis_completed":
             return await self._process_sentinel_analysis(event)
+
+        # Si es análisis de Architect con hallazgos, procesarlos
+        if event.source == "architect" and event.type in ("architect_lint_completed", "architect_analyze_completed"):
+            logger.info("🏛️ Procesando análisis de Architect (info)...")
+            return await self._process_architect_analysis(event)
+
+        # Si es análisis de Warden con hallazgos, procesarlos
+        if event.source == "warden" and event.type.startswith("warden_"):
+            logger.info("🔱 Procesando análisis de Warden (info)...")
+            return await self._process_warden_analysis(event)
 
         return {"action": "logged_only"}
 
@@ -322,6 +347,20 @@ If the code is "Safe" or no critical action is required, do nothing and reply wi
                     level="info", source="cerebro"
                 )
 
+                # Emitir evento de inicio de autofix para trazabilidad en timeline
+                await emit_agent_event({
+                    "source": "cerebro",
+                    "type": "autofix_started",
+                    "severity": "info",
+                    "payload": {
+                        "file": file_path,
+                        "source_agent": event.source,
+                        "max_retries": max_retries,
+                        "description": description[:200] if description else None,
+                        "recommendation": recommendation[:200] if recommendation else None,
+                    }
+                })
+
                 for attempt in range(1, max_retries + 1):
                     logger.warning(f"🔁 Auto-Fix intento {attempt}/{max_retries} para '{file_path}'")
 
@@ -357,6 +396,20 @@ CRITICAL: The build MUST pass after your changes. Prioritize fixing the build er
                     )
 
                     try:
+                        # Emitir evento: enviando comando al Executor
+                        await emit_agent_event({
+                            "source": "cerebro",
+                            "type": "autofix_sending_to_executor",
+                            "severity": "info",
+                            "payload": {
+                                "file": file_path,
+                                "attempt": attempt,
+                                "max_retries": max_retries,
+                                "target": "ejecutor",
+                                "action": "autofix",
+                            }
+                        })
+
                         ack = await send_command("ejecutor", fix_cmd)
                         fix_result = {}
                         if ack and isinstance(ack, dict):
@@ -365,13 +418,35 @@ CRITICAL: The build MUST pass after your changes. Prioritize fixing the build er
                         last_result = fix_result
                         fix_validated = fix_result.get("fix_validated")
                         branch = fix_result.get("branch", f"{branch_prefix}?")
+
+                        # Extraer info de archivos modificados para trazabilidad
+                        modified_files = fix_result.get("modified_files", [])
+                        suggested_files = fix_result.get("suggested_files", [])
+                        files_count = fix_result.get("files_count", 0)
+                        suggested_count = fix_result.get("suggested_count", 0)
+                        build_exit_code = fix_result.get("build_exit_code")
                         build_tool = fix_result.get("build_tool", "desconocido")
                         build_output = (fix_result.get("build_output") or "")[:400]
-
-                        # Capturar info de archivos modificados (incluso si falla)
-                        modified_files = fix_result.get("modified_files", [])
                         git_diff_stat = fix_result.get("git_diff_stat", "")
-                        files_count = fix_result.get("files_count", 0)
+
+                        # Emitir evento: resultado recibido del Executor
+                        await emit_agent_event({
+                            "source": "ejecutor",
+                            "type": "autofix_executor_response",
+                            "severity": "info" if fix_validated is True else ("error" if fix_validated is False else "warning"),
+                            "payload": {
+                                "file": file_path,
+                                "attempt": attempt,
+                                "branch": branch,
+                                "fix_validated": fix_validated,
+                                "build_exit_code": build_exit_code,
+                                "build_tool": build_tool,
+                                "files_modified": files_count,
+                                "files_list": [f["path"] for f in modified_files[:5]] if modified_files else [],
+                                "suggested_count": suggested_count,
+                                "suggested_files": [s["original"] for s in suggested_files] if suggested_files else [],
+                            }
+                        })
 
                         if fix_validated is True:
                             # ✅ ¡ÉXITO! Salir del loop
@@ -431,6 +506,8 @@ CRITICAL: The build MUST pass after your changes. Prioritize fixing the build er
                                     "modified_files": modified_files,
                                     "files_count": files_count,
                                     "git_diff_stat": git_diff_stat,
+                                    "suggested_count": 0,  # Éxito = no hay suggested
+                                    "message": f"Fix validado y aplicado en {files_count} archivos",
                                 }
                             })
                             return  # ← Éxito, salir
@@ -440,9 +517,30 @@ CRITICAL: The build MUST pass after your changes. Prioritize fixing the build er
                             logger.warning(f"⚠️ Intento {attempt} falló build. Acumulando error para reintento...")
                             accumulated_errors.append(build_output)
 
-                            # Info de archivos modificados en este intento
+                            # Info de archivos modificados y suggested en este intento
                             attempt_files = fix_result.get("modified_files", [])
                             attempt_diff = fix_result.get("git_diff_stat", "")[:500]
+                            suggested_files = fix_result.get("suggested_files", [])
+                            suggested_count = fix_result.get("suggested_count", 0)
+
+                            # Emitir evento de build fallido para trazabilidad
+                            await emit_agent_event({
+                                "source": "ejecutor",
+                                "type": "autofix_build_failed",
+                                "severity": "error",
+                                "payload": {
+                                    "file": file_path,
+                                    "attempt": attempt,
+                                    "branch": branch,
+                                    "build_exit_code": fix_result.get("build_exit_code"),
+                                    "build_tool": fix_result.get("build_tool"),
+                                    "build_output_preview": build_output[:500] if build_output else None,
+                                    "files_modified_count": len(attempt_files) if attempt_files else 0,
+                                    "suggested_count": suggested_count,
+                                    "suggested_files": [s["original"] for s in suggested_files] if suggested_files else [],
+                                    "message": f"Build falló en intento {attempt}. {suggested_count} archivos .suggested creados.",
+                                }
+                            })
 
                             if attempt < max_retries:
                                 files_msg = ""
@@ -488,6 +586,10 @@ CRITICAL: The build MUST pass after your changes. Prioritize fixing the build er
                         }
                     )
 
+                    # Info de archivos suggested en el último intento
+                    last_suggested_files = last_result.get("suggested_files", []) if last_result else []
+                    last_suggested_count = last_result.get("suggested_count", 0) if last_result else 0
+
                     # Emitir evento especial al Dashboard con info de archivos
                     await emit_agent_event({
                         "source": "cerebro",
@@ -503,6 +605,10 @@ CRITICAL: The build MUST pass after your changes. Prioritize fixing the build er
                             "modified_files": last_modified_files,
                             "files_count": len(last_modified_files),
                             "git_diff_stat": last_diff_stat,
+                            # Info de archivos .suggested creados
+                            "suggested_count": last_suggested_count,
+                            "suggested_files": [s["original"] for s in last_suggested_files] if last_suggested_files else [],
+                            "suggested_full_paths": [s["suggested"] for s in last_suggested_files] if last_suggested_files else [],
                         }
                     })
 
@@ -585,86 +691,316 @@ CRITICAL: The build MUST pass after your changes. Prioritize fixing the build er
 
     async def _process_sentinel_analysis(self, event: AgentEvent) -> dict:
         """
-        Procesa resultados de análisis de Sentinel.
-        Extrae violaciones/problemas individuales y los agrega como cambios pendientes.
+        Procesa resultados de análisis de Sentinel (Bridge v2).
+        Extrae hallazgos y los agrega como cambios pendientes.
 
-        El payload puede venir en diferentes formatos:
-        - { findings: "texto con problemas..." }
-        - { result: { findings: [...] } }
-        - { violations: [...] }
+        El payload viene del Bridge de Sentinel con formato:
+        - { finding: "descripción", recommendation: "sugerencia", file: "ruta", severity: "...", findings: [...] }
         """
         logger.info(f"🔍 Procesando análisis de Sentinel: {event.type}")
 
         payload = event.payload or {}
-        file_path = payload.get("file", "unknown")
+        file_path = payload.get("file") or payload.get("target", "unknown")
 
-        # Extraer findings (puede ser string o array)
-        findings = payload.get("findings") or payload.get("result", {}).get("findings")
+        # Extraer finding principal (nuevo formato del bridge)
+        finding = payload.get("finding", "")
+        recommendation = payload.get("recommendation", "")
+        severity = payload.get("severity", "warning")
+        summary = payload.get("summary", "")
 
-        if not findings:
-            logger.debug("  ↳ Sin findings para procesar")
-            return {"action": "logged_only"}
+        # Extraer lista de findings
+        findings_list = payload.get("findings", [])
+        findings_count = payload.get("findings_count", len(findings_list))
 
-        # Si findings es un string, dividirlo por líneas/numeros
-        if isinstance(findings, str):
-            # Buscar patrones como "1. **Violación...**" o líneas separadas
-            import re
-            # Dividir por patrones de lista numerada o viñetas
-            problemas = re.split(r'\n(?=\d+\.|\n\*|\n-)', findings)
-            problemas = [p.strip() for p in problemas if p.strip() and len(p.strip()) > 20]
-        elif isinstance(findings, list):
-            problemas = findings
-        else:
-            logger.warning(f"  ↳ Formato de findings desconocido: {type(findings)}")
-            return {"action": "logged_only"}
-
-        if not problemas:
-            logger.debug("  ↳ No se extrajeron problemas del análisis")
-            return {"action": "logged_only"}
-
-        logger.info(f"  ↳ {len(problemas)} problemas detectados")
-
-        # Agregar cada problema como cambio pendiente
+        # Si hay una lista de findings estructurados, procesarlos
         changes_added = []
-        for i, problema in enumerate(problemas[:10]):  # Límite de 10
-            # Extraer descripción (quitar números y markdown)
-            descripcion = str(problema).replace(f"{i+1}.", "").replace("**", "").strip()
+        if findings_list and isinstance(findings_list, list):
+            logger.info(f"  ↳ {len(findings_list)} hallazgos de Sentinel detectados")
+
+            for i, item in enumerate(findings_list[:10]):  # Límite de 10
+                if isinstance(item, dict):
+                    desc = item.get("message") or item.get("description", str(item))
+                    affected_file = item.get("file") or item.get("path") or file_path
+                    item_severity = item.get("severity", "warning")
+                    item_recommendation = item.get("recommendation")
+                else:
+                    desc = str(item)
+                    affected_file = file_path
+                    item_severity = severity
+                    item_recommendation = recommendation
+
+                change = await self.change_manager.add_change(
+                    event_id=event.id,
+                    file_path=affected_file,
+                    description=desc[:200],
+                    severity=item_severity if item_severity in ("critical", "error", "warning") else "warning",
+                    recommendation=item_recommendation or f"Revisar: {desc[:100]}",
+                    metadata={
+                        "source": "sentinel_analysis",
+                        "event_type": event.type,
+                        "finding_index": i,
+                        "full_finding": str(item),
+                    },
+                )
+                changes_added.append(change.id)
+
+        # Si no hay lista de findings pero sí hay un finding principal, agregarlo
+        elif finding:
+            logger.info(f"  ↳ 1 hallazgo de Sentinel detectado")
 
             change = await self.change_manager.add_change(
                 event_id=event.id,
                 file_path=file_path,
-                description=descripcion[:200],  # Máximo 200 chars
-                severity="warning",  # Sentinel ya filtró, son warning
-                recommendation=f"Revisar y corregir: {descripcion[:100]}",
+                description=finding[:200],
+                severity=severity if severity in ("critical", "error", "warning") else "warning",
+                recommendation=recommendation or "Revisar hallazgo de Sentinel",
                 metadata={
                     "source": "sentinel_analysis",
-                    "full_finding": str(problema),
-                    "index": i,
+                    "event_type": event.type,
+                    "summary": summary,
                 },
             )
             changes_added.append(change.id)
 
-        logger.info(f"✅ {len(changes_added)} cambios agregados a ChangeManager")
+        if not changes_added:
+            logger.debug("  ↳ Sin hallazgos de Sentinel para procesar")
+            return {"action": "logged_only"}
+
+        logger.info(f"✅ {len(changes_added)} cambios de Sentinel agregados a ChangeManager")
 
         # Notificar al usuario
         from app.dispatcher import notify
-        message = f"🔍 **Sentinel detectó {len(changes_added)} problemas** en `{file_path}`\n\n"
+        message = f"🛡️ **Sentinel detectó {len(changes_added)} problemas** en `{file_path}`\n\n"
 
-        for i, problema in enumerate(problemas[:5]):
-            desc = str(problema).replace(f"{i+1}.", "").replace("**", "")[:150]
-            message += f"{i+1}. {desc}...\n" if len(str(problema)) > 150 else f"{i+1}. {desc}\n"
+        if finding:
+            message += f"**Hallazgo:** {finding[:200]}\n\n"
 
-        if len(problemas) > 5:
-            message += f"\n_...y {len(problemas) - 5} más_\n"
+        if summary:
+            message += f"**Resumen:** {summary[:200]}\n\n"
+
+        if findings_list and len(findings_list) > 0:
+            for i, item in enumerate(findings_list[:5]):
+                if isinstance(item, dict):
+                    desc = item.get("message", str(item))[:150]
+                else:
+                    desc = str(item)[:150]
+                message += f"{i+1}. {desc}...\n"
+
+            if len(findings_list) > 5:
+                message += f"\n_...y {len(findings_list) - 5} más_\n"
 
         message += "\n**Revisa el panel de cambios para aprobar/rechazar correcciones.**"
 
-        await notify(message, level="warning", source="cerebro")
+        await notify(message, level=severity if severity in ["critical", "error", "warning"] else "warning", source="cerebro")
 
         return {
-            "action": "process_analysis",
+            "action": "process_sentinel_analysis",
             "changes_added": len(changes_added),
             "change_ids": changes_added,
+        }
+
+    async def _process_architect_analysis(self, event: AgentEvent) -> dict:
+        """
+        Procesa resultados de análisis de Architect ADK.
+        Extrae hallazgos de arquitectura y los agrega como cambios pendientes.
+
+        El payload viene de Architect ADK con formato:
+        - { finding: "descripción", recommendation: "sugerencia", file: "ruta" }
+        - { result: { findings: [...], health_score: XX } }
+        """
+        logger.info(f"🏛️ Procesando análisis de Architect: {event.type}")
+
+        payload = event.payload or {}
+
+        # Extraer información del payload de Architect
+        file_path = payload.get("file") or payload.get("target") or "unknown"
+        finding = payload.get("finding", "")
+        recommendation = payload.get("recommendation", "")
+        summary = payload.get("summary", "")
+
+        # Extraer findings del resultado raw si existe
+        raw_result = payload.get("result", {}).get("raw", {})
+        findings_list = []
+        if isinstance(raw_result, dict):
+            result_data = raw_result.get("result", {})
+            if isinstance(result_data, dict):
+                findings_list = result_data.get("findings", [])
+
+        # Si no hay finding específico pero hay summary, usar el summary
+        if not finding and summary:
+            finding = summary
+
+        # Si no hay recommendation pero hay summary, usar summary
+        if not recommendation and summary:
+            recommendation = summary
+
+        # Determinar severidad
+        severity = payload.get("severity", "warning")
+        if event.severity:
+            severity = event.severity.value
+
+        # Si no hay hallazgos claros, no agregar cambios
+        if not finding and not findings_list:
+            logger.debug("  ↳ Sin hallazgos de arquitectura para procesar")
+            return {"action": "logged_only"}
+
+        changes_added = []
+
+        # Si hay una lista de findings, procesar cada uno
+        if findings_list and isinstance(findings_list, list):
+            logger.info(f"  ↳ {len(findings_list)} hallazgos de arquitectura detectados")
+
+            for i, item in enumerate(findings_list[:10]):  # Límite de 10
+                if isinstance(item, dict):
+                    desc = item.get("message") or item.get("description") or str(item)
+                    affected_file = item.get("file") or item.get("path") or file_path
+                    rule = item.get("rule", "")
+                    sev = item.get("severity", "warning")
+                else:
+                    desc = str(item)
+                    affected_file = file_path
+                    rule = ""
+                    sev = severity
+
+                # Construir descripción completa
+                full_desc = desc
+                if rule:
+                    full_desc = f"[{rule}] {desc}"
+
+                change = await self.change_manager.add_change(
+                    event_id=event.id,
+                    file_path=affected_file,
+                    description=full_desc[:200],
+                    severity=sev if sev in ("critical", "error", "warning") else "warning",
+                    recommendation=recommendation or f"Revisar violación de arquitectura: {desc[:100]}",
+                    metadata={
+                        "source": "architect_analysis",
+                        "event_type": event.type,
+                        "finding_index": i,
+                        "health_score": payload.get("result", {}).get("health_score"),
+                        "full_finding": str(item),
+                    },
+                )
+                changes_added.append(change.id)
+
+        # Si hay un finding único (formato simplificado)
+        elif finding:
+            logger.info(f"  ↳ 1 hallazgo de arquitectura detectado")
+
+            change = await self.change_manager.add_change(
+                event_id=event.id,
+                file_path=file_path,
+                description=finding[:200],
+                severity=severity if severity in ("critical", "error", "warning") else "warning",
+                recommendation=recommendation or "Revisar violación de arquitectura detectada",
+                metadata={
+                    "source": "architect_analysis",
+                    "event_type": event.type,
+                    "health_score": payload.get("result", {}).get("health_score"),
+                    "analysis": summary,
+                },
+            )
+            changes_added.append(change.id)
+
+        if not changes_added:
+            return {"action": "logged_only"}
+
+        logger.info(f"✅ {len(changes_added)} cambios de Architect agregados a ChangeManager")
+
+        # Notificar al usuario
+        from app.dispatcher import notify
+        message = f"🏛️ **Architect detectó {len(changes_added)} violaciones** en `{file_path}`\n\n"
+
+        if finding:
+            message += f"**Hallazgo:** {finding[:200]}\n\n"
+
+        if recommendation:
+            message += f"**Sugerencia:** {recommendation[:200]}\n\n"
+
+        message += "**Revisa el panel de cambios para aprobar/rechazar correcciones.**"
+
+        await notify(message, level=severity, source="cerebro")
+
+        return {
+            "action": "process_architect_analysis",
+            "changes_added": len(changes_added),
+            "change_ids": changes_added,
+        }
+
+    async def _process_warden_analysis(self, event: AgentEvent) -> dict:
+        """
+        Procesa resultados de análisis de Warden.
+        Extrae hallazgos de seguridad y los agrega como cambios pendientes.
+
+        El payload viene de Warden ADK con formato:
+        - { finding: "descripción", recommendation: "sugerencia", file: "ruta" }
+        - { result: { top_risks: [...], secrets_found: [...] } }
+        """
+        logger.info(f"🔱 Procesando análisis de Warden: {event.type}")
+
+        payload = event.payload or {}
+
+        # Extraer información del payload de Warden
+        file_path = payload.get("file") or payload.get("target") or "unknown"
+        finding = payload.get("finding", "")
+        recommendation = payload.get("recommendation", "")
+        summary = payload.get("summary", "")
+
+        # Extraer info adicional
+        risks_count = payload.get("risks_count", 0)
+        secrets_count = payload.get("secrets_count", 0)
+
+        # Determinar severidad
+        severity = payload.get("severity", "warning")
+        if event.severity:
+            severity = event.severity.value
+
+        # Si no hay hallazgos claros, no agregar cambios
+        if not finding:
+            logger.debug("  ↳ Sin hallazgos de seguridad para procesar")
+            return {"action": "logged_only"}
+
+        # Agregar el hallazgo como cambio pendiente
+        change = await self.change_manager.add_change(
+            event_id=event.id,
+            file_path=file_path,
+            description=finding[:200],
+            severity=severity if severity in ("critical", "error", "warning") else "warning",
+            recommendation=recommendation or "Revisar hallazgo de seguridad detectado",
+            metadata={
+                "source": "warden_analysis",
+                "event_type": event.type,
+                "risks_count": risks_count,
+                "secrets_count": secrets_count,
+                "analysis": summary,
+            },
+        )
+
+        logger.info(f"✅ Cambio de Warden agregado a ChangeManager: {change.id}")
+
+        # Notificar al usuario
+        from app.dispatcher import notify
+        message = f"🔱 **Warden detectó un problema de seguridad** en `{file_path}`\n\n"
+
+        if finding:
+            message += f"**Hallazgo:** {finding[:200]}\n\n"
+
+        if recommendation:
+            message += f"**Sugerencia:** {recommendation[:200]}\n\n"
+
+        if risks_count > 0:
+            message += f"*Riesgos identificados: {risks_count}*\n"
+        if secrets_count > 0:
+            message += f"*⚠️ Secretos expuestos: {secrets_count}*\n"
+
+        message += "\n**Revisa el panel de cambios para aprobar/rechazar correcciones.**"
+
+        await notify(message, level=severity, source="cerebro")
+
+        return {
+            "action": "process_warden_analysis",
+            "changes_added": 1,
+            "change_id": change.id,
         }
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -773,26 +1109,22 @@ CRITICAL: The build MUST pass after your changes. Prioritize fixing the build er
         return {"status": "ok", "project": project_name, "restarted": True}
 
     async def get_architect_config(self) -> dict:
-        """Lee el archivo architect.json del proyecto activo"""
+        """Obtiene la configuración de Architect del ConfigManager"""
         if not self.active_project:
             return {"error": "No hay proyecto activo seleccionado"}
-        
-        config_path = os.path.join(self.workspace_root, self.active_project, "architect.json")
-        if not os.path.exists(config_path):
+
+        config_manager = UnifiedConfigManager.get_instance()
+        config = config_manager.get_project_config(self.active_project, 'architect')
+
+        if not config:
             # Retornar una estructura básica si no existe
             return {
                 "version": "1.0",
                 "rules": [],
                 "exclude": ["**/node_modules/**"]
             }
-            
-        import json
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Error leyendo architect.json: {e}")
-            return {"error": str(e)}
+
+        return config
 
     async def save_architect_config(self, config: dict) -> dict:
         """Guarda el archivo architect.json en el proyecto activo"""
@@ -823,21 +1155,17 @@ CRITICAL: The build MUST pass after your changes. Prioritize fixing the build er
             return {"status": "error", "message": str(e)}
 
     async def get_sentinel_config(self) -> dict:
-        """Lee el archivo .sentinelrc.toml del proyecto activo"""
+        """Obtiene la configuración de Sentinel del ConfigManager"""
         if not self.active_project:
             return {"error": "No hay proyecto activo seleccionado"}
-        
-        config_path = os.path.join(self.workspace_root, self.active_project, ".sentinelrc.toml")
-        if not os.path.exists(config_path):
-            return {"error": "Archivo .sentinelrc.toml no encontrado"}
-            
-        import toml
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                return toml.load(f)
-        except Exception as e:
-            logger.error(f"Error leyendo .sentinelrc.toml: {e}")
-            return {"error": str(e)}
+
+        config_manager = UnifiedConfigManager.get_instance()
+        config = config_manager.get_project_config(self.active_project, 'sentinel')
+
+        if not config:
+            return {"error": "Configuración de Sentinel no encontrada"}
+
+        return config
 
     async def save_sentinel_config(self, config: dict) -> dict:
         """Guarda el archivo .sentinelrc.toml en el proyecto activo"""
@@ -855,22 +1183,484 @@ CRITICAL: The build MUST pass after your changes. Prioritize fixing the build er
             return {"status": "error", "message": str(e)}
 
     async def sentinel_init(self) -> dict:
-        """Lanza el comando de inicialización de Sentinel"""
+        """
+        Lanza el wizard interactivo de inicialización de Sentinel.
+        Usa el sistema de eventos interaction_required para guiar al usuario paso a paso.
+        """
         if not self.active_project:
             return {"error": "No hay proyecto activo seleccionado"}
-            
+
         project_path = os.path.join(self.workspace_root, self.active_project).replace("\\", "/")
-        
-        # Enviar comando a Sentinel para que se inicialice (o re-inicialice)
-        ack = await send_command(
-            "sentinel",
-            OrchestratorCommand(
-                action="monitor", # Sentinel proyecta el setup si no hay config al monitorear
-                target=project_path
-            )
+
+        # Iniciar el wizard emitiendo el primer paso: framework detection
+        from app.sockets import emit_agent_event
+        import uuid
+
+        wizard_id = f"sentinel-wizard-{uuid.uuid4().hex[:8]}"
+
+        # Guardar estado del wizard en el contexto
+        self.context_db.record_pattern(
+            pattern_type="sentinel_wizard_started",
+            description="Wizard de inicialización de Sentinel iniciado",
+            severity="info",
+            file_path=project_path,
+            metadata={"wizard_id": wizard_id, "step": "framework_detection", "project": self.active_project}
         )
-        
-        return {"status": "ok", "ack": ack}
+
+        # Paso 1: Pedir al usuario que confirme o seleccione el framework
+        # Obtener info del modelo configurado para mostrarlo
+        from app.config_manager import UnifiedConfigManager
+        import asyncio
+        config_manager = UnifiedConfigManager.get_instance()
+        llm_config = config_manager.get_agent_llm_config("sentinel")
+
+        logger.info(f"🛡️ [sentinel_init] Emitiendo interaction_required para wizard {wizard_id}")
+
+        await emit_agent_event({
+            "source": "sentinel",
+            "type": "interaction_required",
+            "severity": "info",
+            "payload": {
+                "prompt_id": f"{wizard_id}-framework",
+                "message": f"🛡️ **Sentinel Setup Wizard**\n\nPaso 1/3: Framework Detection\n\nEl asistente usará el modelo **{llm_config.model}** ({llm_config.provider}) configurado en Global Config para analizar tu proyecto.",
+                "options": ["auto-detect", "manual-select"],
+                "wizard_step": 1,
+                "total_steps": 3,
+                "wizard_id": wizard_id,
+                "project": self.active_project,
+                "llm_model": llm_config.model,
+                "llm_provider": llm_config.provider
+            }
+        })
+
+        logger.info(f"🛡️ [sentinel_init] Evento interaction_required emitido")
+
+        # También emitir evento de inicio del wizard
+        await emit_agent_event({
+            "source": "sentinel",
+            "type": "wizard_init_started",
+            "severity": "info",
+            "payload": {
+                "wizard_id": wizard_id,
+                "message": "Wizard de inicialización de Sentinel iniciado",
+                "project": self.active_project,
+                "step": 1,
+                "total_steps": 3
+            }
+        })
+
+        return {"status": "ok", "message": "Wizard de Sentinel iniciado. Revisa las notificaciones.", "wizard_id": wizard_id}
+
+    async def handle_sentinel_wizard_response(self, wizard_id: str, step: str, answer: str) -> dict:
+        """
+        Maneja las respuestas del wizard de Sentinel paso a paso.
+        """
+        from app.sockets import emit_agent_event
+        import uuid
+
+        project_path = os.path.join(self.workspace_root, self.active_project).replace("\\", "/")
+        logger.info(f"🛡️ [sentinel_wizard] handle_sentinel_wizardResponse called: wizard_id={wizard_id}, step='{step}', answer='{answer}'")
+
+        if step == "framework_detection" or step == "1":
+            # Framework detectado/seleccionado, pasar a paso 2: AI Provider
+            if answer == "auto-detect":
+                # Usar IA para detectar framework con el modelo configurado en Global Config
+                from app.ai_utils import detectar_framework_con_ia, AIConfig
+                from app.config_manager import UnifiedConfigManager
+
+                config_manager = UnifiedConfigManager.get_instance()
+                llm_config = config_manager.get_agent_llm_config("sentinel")
+
+                # Detectar si la URL base tiene /v1 o necesita agregarlo
+                base_url = llm_config.base_url.rstrip('/') if llm_config.base_url else 'http://localhost:11434'
+                final_url = f"{base_url}/v1" if not base_url.endswith('/v1') else base_url
+
+                logger.info(f"🔍 [sentinel_wizard] LLM Config: provider={llm_config.provider}, model={llm_config.model}")
+                logger.info(f"🔍 [sentinel_wizard] URL base desde Global Config: {llm_config.base_url}")
+
+                ai_config = AIConfig(
+                    name="sentinel-wizard",
+                    provider=llm_config.provider,
+                    api_url=llm_config.base_url,
+                    api_key=llm_config.api_key,
+                    model=llm_config.model
+                )
+
+                logger.info(f"🔍 [sentinel_wizard] Iniciando detección de framework con IA: {ai_config.provider} / {ai_config.model}")
+
+                # Notificar al dashboard que está consultando IA
+                await emit_agent_event({
+                    "source": "sentinel",
+                    "type": "wizard_ai_query_start",
+                    "severity": "info",
+                    "payload": {
+                        "wizard_id": wizard_id,
+                        "step": 1,
+                        "provider": ai_config.provider,
+                        "model": ai_config.model,
+                        "message": f"Consultando {ai_config.model} ({ai_config.provider}) para detectar framework..."
+                    }
+                })
+
+                # Intentar detectar framework con IA
+                try:
+                    framework_detected = await detectar_framework_con_ia(project_path, [ai_config])
+                    error_info = None
+                except Exception as e:
+                    import traceback
+                    framework_detected = None
+                    error_info = str(e)
+                    logger.error(f"🔍 [sentinel_wizard] Error en detectar_framework_con_ia: {e}")
+                    logger.error(f"🔍 [sentinel_wizard] Traceback: {traceback.format_exc()}")
+
+                # Notificar resultado
+                await emit_agent_event({
+                    "source": "sentinel",
+                    "type": "wizard_ai_query_complete",
+                    "severity": "info" if framework_detected else "warning",
+                    "payload": {
+                        "wizard_id": wizard_id,
+                        "step": 1,
+                        "framework_detected": framework_detected,
+                        "error_info": error_info,
+                        "api_url": ai_config.api_url,
+                        "provider": ai_config.provider,
+                        "model": ai_config.model,
+                        "message": f"Framework detectado: {framework_detected}" if framework_detected else f"IA no respondió: {error_info or 'Sin respuesta'}"
+                    }
+                })
+
+                logger.info(f"🔍 [sentinel_wizard] Resultado de detección: {framework_detected}")
+
+                if framework_detected:
+                    framework = framework_detected
+                    logger.info(f"✅ Framework detectado por IA: {framework}")
+                else:
+                    # Fallback a detección por archivos
+                    framework = await self._detect_framework(project_path)
+                    logger.info(f"⚠️ IA no detectó framework, usando detección por archivos: {framework}")
+            else:
+                framework = answer
+
+            # Obtener el provider configurado en Global Config
+            config_manager = UnifiedConfigManager.get_instance()
+            llm_config = config_manager.get_agent_llm_config("sentinel")
+            current_provider = llm_config.provider
+
+            logger.info(f"🛡️ [sentinel_wizard] Emitiendo PASO 2: AI Provider. Provider actual: {current_provider}, Modelo: {llm_config.model}")
+
+            await emit_agent_event({
+                "source": "sentinel",
+                "type": "interaction_required",
+                "severity": "info",
+                "payload": {
+                    "prompt_id": f"{wizard_id}-ai-provider",
+                    "message": f"🛡️ **Sentinel Setup Wizard**\n\nPaso 2/3: AI Provider Configuration\n\nFramework detectado: **{framework}**\n\nProvider configurado en Global Config: **{current_provider}** ({llm_config.model})\n\n¿Usar este provider o seleccionar otro?",
+                    "options": [f"use-{current_provider}", "change-provider"],
+                    "wizard_step": 2,
+                    "total_steps": 3,
+                    "wizard_id": wizard_id,
+                    "framework": framework,
+                    "current_provider": current_provider,
+                    "current_model": llm_config.model
+                }
+            })
+
+            logger.info(f"🛡️ [sentinel_wizard] PASO 2 emitido exitosamente")
+
+            # Guardar progreso
+            self.context_db.record_pattern(
+                pattern_type="sentinel_wizard_progress",
+                description=f"Framework seleccionado: {framework}",
+                severity="info",
+                file_path=project_path,
+                metadata={"wizard_id": wizard_id, "step": "ai_provider", "framework": framework}
+            )
+
+            return {"status": "ok", "step": 2, "message": "Paso 2: Configuración de AI Provider"}
+
+        elif step == "ai_provider" or step == "2":
+            # AI Provider seleccionado, pasar a paso 3: Testing config
+            if answer == "change-provider":
+                # Si elige cambiar, mostrar opciones de providers
+                await emit_agent_event({
+                    "source": "sentinel",
+                    "type": "interaction_required",
+                    "severity": "info",
+                    "payload": {
+                        "prompt_id": f"{wizard_id}-ai-provider-select",
+                        "message": f"🛡️ **Sentinel Setup Wizard**\n\nPaso 2/3: Seleccionar AI Provider\n\nSelecciona el proveedor de IA para análisis:",
+                        "options": ["anthropic", "openai", "ollama", "google"],
+                        "wizard_step": 2,
+                        "total_steps": 3,
+                        "wizard_id": wizard_id,
+                        "substep": "select"
+                    }
+                })
+                return {"status": "ok", "step": 2, "message": "Seleccionar AI Provider"}
+
+            # Extraer provider de la respuesta (use-ollama -> ollama)
+            provider = answer.lower().replace("use-", "") if answer.startswith("use-") else answer.lower()
+
+            # Guardar provider seleccionado en el contexto para el paso 3
+            self.context_db.record_pattern(
+                pattern_type="sentinel_wizard_ai_config",
+                description=f"AI Provider configurado: {provider}",
+                severity="info",
+                file_path=project_path,
+                metadata={"wizard_id": wizard_id, "provider": provider, "use_global_config": answer.startswith("use-")}
+            )
+
+            # Sugerir config de testing basada en el framework
+            test_suggestions = await self._get_test_suggestions(project_path)
+
+            await emit_agent_event({
+                "source": "sentinel",
+                "type": "interaction_required",
+                "severity": "info",
+                "payload": {
+                    "prompt_id": f"{wizard_id}-testing",
+                    "message": f"🛡️ **Sentinel Setup Wizard**\n\nPaso 3/3: Testing Configuration\n\nProveedor de IA: **{provider}**\n\n{test_suggestions}\n\n¿Habilitar sugerencias de testing automáticas?",
+                    "options": ["yes", "no"],
+                    "wizard_step": 3,
+                    "total_steps": 3,
+                    "wizard_id": wizard_id,
+                    "provider": provider
+                }
+            })
+
+            # Guardar progreso
+            self.context_db.record_pattern(
+                pattern_type="sentinel_wizard_progress",
+                description=f"AI Provider seleccionado: {provider}",
+                severity="info",
+                file_path=project_path,
+                metadata={"wizard_id": wizard_id, "step": "testing_config", "provider": provider}
+            )
+
+            return {"status": "ok", "step": 3, "message": "Paso 3: Configuración de Testing"}
+
+        elif step == "testing_config" or step == "3":
+            try:
+                logger.info(f"🛡️ [sentinel_wizard] ========== PROCESANDO PASO 3 ==========")
+                logger.info(f"🛡️ [sentinel_wizard] Answer recibido: '{answer}' (step='{step}')")
+                # Wizard completado - guardar configuración final
+                enable_testing = answer.lower() in ["yes", "true", "1", "si"]
+                logger.info(f"🛡️ [sentinel_wizard] Testing enabled: {enable_testing} (answer.lower()={answer.lower()})")
+
+                # Crear configuración de Sentinel (pasar wizard_id para obtener config de LLM)
+                logger.info(f"🛡️ [sentinel_wizard] Generando config para proyecto: {project_path}")
+                logger.info(f"🛡️ [sentinel_wizard] wizard_id={wizard_id}, active_project={self.active_project}")
+                config = await self._generate_sentinel_config(project_path, enable_testing, wizard_id)
+                logger.info(f"🛡️ [sentinel_wizard] Config generada con keys: {list(config.keys())}")
+
+                # Guardar el archivo de configuración
+                config_path = os.path.join(project_path, ".sentinelrc.toml")
+                config_path = config_path.replace("\\", "/")  # Normalizar path para Windows
+                logger.info(f"🛡️ [sentinel_wizard] Guardando config en: {config_path}")
+                logger.info(f"🛡️ [sentinel_wizard] Contenido de config: {config}")
+                try:
+                    try:
+                        import toml
+                    except ImportError:
+                        logger.error(f"🛡️ [sentinel_wizard] ERROR: modulo 'toml' no instalado")
+                        return {"status": "error", "message": "Modulo 'toml' no instalado"}
+                    logger.info(f"🛡️ [sentinel_wizard] Escribiendo archivo...")
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        toml.dump(config, f)
+                    logger.info(f"🛡️ [sentinel_wizard] Config guardada exitosamente en {config_path}")
+                    # Verificar que el archivo existe
+                    if os.path.exists(config_path):
+                        file_size = os.path.getsize(config_path)
+                        logger.info(f"🛡️ [sentinel_wizard] Archivo verificado: existe, tamaño={file_size} bytes")
+                    else:
+                        logger.error(f"🛡️ [sentinel_wizard] Archivo NO existe después de guardar")
+
+                    # Emitir evento de finalización
+                    logger.info(f"🛡️ [sentinel_wizard] Emitiendo evento wizard_init_completed")
+                    await emit_agent_event({
+                        "source": "sentinel",
+                        "type": "wizard_init_completed",
+                        "severity": "info",
+                        "payload": {
+                            "wizard_id": wizard_id,
+                            "message": "✅ Wizard de Sentinel completado exitosamente",
+                            "project": self.active_project,
+                            "config_path": str(config_path),
+                            "testing_enabled": enable_testing
+                        }
+                    })
+
+                    # Iniciar monitoreo automáticamente
+                    await send_command(
+                        "sentinel",
+                        OrchestratorCommand(action="monitor", target=project_path)
+                    )
+
+                    return {
+                        "status": "ok",
+                        "message": "Wizard completado y configuración guardada",
+                        "config_path": str(config_path),
+                        "testing_enabled": enable_testing
+                    }
+
+                except Exception as e:
+                    logger.error(f"🛡️ [sentinel_wizard] Error guardando configuración de Sentinel: {e}")
+                    import traceback
+                    logger.error(f"🛡️ [sentinel_wizard] Traceback: {traceback.format_exc()}")
+                    return {"status": "error", "message": str(e)}
+            except Exception as outer_e:
+                logger.error(f"🛡️ [sentinel_wizard] ERROR CRÍTICO en paso 3: {outer_e}")
+                import traceback
+                logger.error(f"🛡️ [sentinel_wizard] Traceback: {traceback.format_exc()}")
+                return {"status": "error", "message": f"Error crítico: {outer_e}"}
+
+        logger.warning(f"🛡️ [sentinel_wizard] Paso no reconocido: '{step}'")
+        return {"status": "error", "message": f"Paso desconocido: {step}"}
+
+    async def _detect_framework(self, project_path: str) -> str:
+        """Detecta el framework del proyecto basándose en archivos presentes."""
+        import os
+
+        indicators = {
+            "nextjs": ["next.config.js", "next.config.mjs"],
+            "nest": ["nest-cli.json"],
+            "react": ["vite.config.js", "vite.config.ts", "src/App.jsx", "src/App.tsx"],
+            "vue": ["vue.config.js", "vite.config.js"],
+            "angular": ["angular.json"],
+            "django": ["manage.py", "requirements.txt"],
+            "flask": ["app.py", "requirements.txt"],
+            "rust": ["Cargo.toml"],
+            "go": ["go.mod"],
+            "python": ["requirements.txt", "setup.py", "pyproject.toml"],
+            "nodejs": ["package.json"]
+        }
+
+        for framework, files in indicators.items():
+            for file in files:
+                if os.path.exists(os.path.join(project_path, file)):
+                    return framework
+
+        return "unknown"
+
+    async def _get_test_suggestions(self, project_path: str) -> str:
+        """Genera sugerencias de testing basadas en el proyecto."""
+        import os
+
+        has_tests = False
+        test_framework = None
+
+        # Verificar presencia de tests existentes
+        test_patterns = ["**/*.test.*", "**/*.spec.*", "**/test_*.py", "tests/", "__tests__/"]
+        for pattern in test_patterns:
+            import glob
+            if glob.glob(os.path.join(project_path, pattern), recursive=True):
+                has_tests = True
+                break
+
+        # Detectar framework de testing
+        if os.path.exists(os.path.join(project_path, "package.json")):
+            try:
+                with open(os.path.join(project_path, "package.json"), "r") as f:
+                    pkg = json.load(f)
+                    deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+                    if "jest" in deps:
+                        test_framework = "Jest"
+                    elif "vitest" in deps:
+                        test_framework = "Vitest"
+                    elif "cypress" in deps:
+                        test_framework = "Cypress"
+                    elif "playwright" in deps:
+                        test_framework = "Playwright"
+            except:
+                pass
+
+        if has_tests:
+            if test_framework:
+                return f"✓ Tests existentes detectados ({test_framework})"
+            return "✓ Tests existentes detectados"
+        return "⚠ No se detectaron tests existentes"
+
+    async def _generate_sentinel_config(self, project_path: str, enable_testing: bool, wizard_id: str = None) -> dict:
+        """Genera la configuración inicial de Sentinel basada en el proyecto."""
+        logger.info(f"🛡️ [_generate_sentinel_config] Iniciando: project_path={project_path}, enable_testing={enable_testing}, wizard_id={wizard_id}")
+        framework = await self._detect_framework(project_path)
+        logger.info(f"🛡️ [_generate_sentinel_config] Framework detectado: {framework}")
+
+        # Obtener configuración de LLM desde Global Config
+        from app.config_manager import UnifiedConfigManager
+        config_manager = UnifiedConfigManager.get_instance()
+        llm_config = config_manager.get_agent_llm_config("sentinel")
+        logger.info(f"🛡️ [_generate_sentinel_config] LLM Config: provider={llm_config.provider}, model={llm_config.model}, base_url={llm_config.base_url}")
+
+        # Determinar el modelo y provider a usar
+        # Si hay un wizard_id, buscar si se guardó configuración específica
+        model_name = llm_config.model
+        provider = llm_config.provider
+        api_url = llm_config.base_url
+        api_key = llm_config.api_key
+
+        if wizard_id:
+            logger.info(f"🛡️ [_generate_sentinel_config] Buscando patterns para wizard_id={wizard_id}")
+            # Buscar si se guardó configuración específica del wizard
+            patterns = self.context_db.get_recent_patterns(
+                source_filter="sentinel_wizard_ai_config",
+                limit=10
+            )
+            logger.info(f"🛡️ [_generate_sentinel_config] Patterns encontrados: {len(patterns)}")
+            for p in patterns:
+                if p.get("metadata", {}).get("wizard_id") == wizard_id:
+                    provider = p["metadata"].get("provider", provider)
+                    logger.info(f"🛡️ [_generate_sentinel_config] Provider actualizado desde pattern: {provider}")
+                    break
+
+        config = {
+            "sentinel": {
+                "framework": framework,
+                "code_language": self._get_language_for_framework(framework),
+                "enable_monitor": True,
+                "enable_git_hooks": True
+            },
+            "analysis": {
+                "max_complexity": 10,
+                "max_lines_per_function": 60,
+                "forbidden_patterns": ["console.log", "debugger", "TODO: HACK"],
+                "severity_threshold": "warning"
+            },
+            "testing": {
+                "enabled": enable_testing,
+                "auto_suggest": enable_testing,
+                "min_coverage": 70 if enable_testing else 0
+            },
+            "primary_model": {
+                "name": model_name,
+                "url": api_url,
+                "api_key": api_key,
+                "provider": provider,
+                "temperature": 0.1
+            }
+        }
+
+        logger.info(f"🛡️ [sentinel_wizard] Config generada: framework={framework}, provider={provider}, model={model_name}, url={api_url}")
+
+        return config
+
+    def _get_language_for_framework(self, framework: str) -> str:
+        """Retorna el lenguaje principal para un framework dado."""
+        mapping = {
+            "nextjs": "typescript",
+            "nest": "typescript",
+            "react": "typescript",
+            "vue": "typescript",
+            "angular": "typescript",
+            "django": "python",
+            "flask": "python",
+            "rust": "rust",
+            "go": "go",
+            "python": "python",
+            "nodejs": "javascript"
+        }
+        return mapping.get(framework, "unknown")
 
     async def architect_init(self, pattern: str | None = None) -> dict:
         """Llama al ejecutor para correr el comando 'init' de Architect en el proyecto activo"""

@@ -84,22 +84,102 @@ async def dispatch_command(agent: str, request: Request):
 @router.post("/interaction-response", response_model=ApiResponse, summary="Responder a una interacción de usuario")
 async def interaction_response(request: Request):
     from app.sockets import pending_interaction_events
+    from app.orchestrator import orchestrator
 
-    body = await request.json()
-    prompt_id = body.get("prompt_id")
-    answer = body.get("answer")
+    try:
+        body = await request.json()
+        prompt_id = body.get("prompt_id")
+        answer = body.get("answer")
+    except Exception as e:
+        logger.error(f"❌ Error parsing JSON: {e}")
+        raise HTTPException(status_code=400, detail=f"Error parsing request: {e}")
+
+    logger.info(f"📨 /interaction-response recibido: prompt_id={prompt_id}, answer={answer}")
 
     if not prompt_id or not answer:
         raise HTTPException(status_code=400, detail="prompt_id y answer son requeridos")
 
+    # Limpiar de eventos pendientes
     pending_interaction_events[:] = [
         e for e in pending_interaction_events
         if e.get("payload", {}).get("prompt_id") != prompt_id
     ]
     logger.info(f"✅ Evento de interacción {prompt_id} respondido y eliminado de pendientes")
 
+    # Detectar si es un wizard de Sentinel
+    if prompt_id.startswith("sentinel-wizard-"):
+        try:
+            # Extraer wizard_id y step del prompt_id
+            # Format: sentinel-wizard-{uuid}-{step}
+            # Ejemplo: sentinel-wizard-a1b2c3d4-framework
+            parts = prompt_id.split("-")
+            if len(parts) >= 4:
+                wizard_id = f"{parts[0]}-{parts[1]}-{parts[2]}"
+                step = parts[3]
+            else:
+                wizard_id = prompt_id
+                step = "unknown"
+
+            logger.info(f"🛡️ Routing respuesta de Sentinel wizard: wizard_id={wizard_id}, step={step}, answer={answer}")
+
+            # Mapear step a formato esperado por el orchestrator
+            step_mapping = {
+                "framework": "framework_detection",
+                "ai": "ai_provider",
+                "ai-provider-select": "ai_provider",
+                "provider": "ai_provider",
+                "testing": "testing_config"
+            }
+            mapped_step = step_mapping.get(step, step)
+            logger.info(f"🛡️ Step mapeado: {step} -> {mapped_step}")
+
+            # Manejar respuesta del wizard
+            result = await orchestrator.handle_sentinel_wizard_response(wizard_id, mapped_step, answer)
+            logger.info(f"🛡️ Resultado de handle_sentinel_wizard_response: {result}")
+            return ApiResponse(ok=True, message="Respuesta de wizard procesada", data=result)
+        except Exception as e:
+            logger.exception(f"❌ Error en wizard response: {e}")
+            raise HTTPException(status_code=500, detail=f"Error procesando wizard: {str(e)}")
+
+    # Fallback: enviar a Sentinel como comando de respuesta normal
     await send_command(
         "sentinel",
         OrchestratorCommand(action="answer", options={"prompt_id": prompt_id, "answer": answer})
     )
     return ApiResponse(ok=True, message="Respuesta de interacción enviada")
+
+
+@router.get("/logs", response_model=ApiResponse, summary="Obtener logs recientes de Cerebro")
+async def get_logs(lines: int = 50):
+    """Devuelve las últimas N líneas del log de Cerebro para debugging"""
+    import subprocess
+    try:
+        # Intentar leer del archivo de log si existe
+        log_paths = [
+            "/tmp/cerebro.log",
+            "/var/log/cerebro.log",
+            str(Path.home() / ".cerebro" / "cerebro.log"),
+        ]
+
+        for log_path in log_paths:
+            if os.path.exists(log_path):
+                result = subprocess.run(
+                    ["tail", "-n", str(lines), log_path],
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode == 0:
+                    return ApiResponse(ok=True, data={"logs": result.stdout.split("\n")})
+
+        # Si no hay archivo, intentar con journalctl o pm2 logs
+        result = subprocess.run(
+            ["journalctl", "-u", "cerebro", "-n", str(lines), "--no-pager"],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            return ApiResponse(ok=True, data={"logs": result.stdout.split("\n")})
+
+        return ApiResponse(ok=False, message="No se pudo acceder a los logs", data={"logs": []})
+    except Exception as e:
+        return ApiResponse(ok=False, message=f"Error leyendo logs: {str(e)}", data={"logs": []})

@@ -16,10 +16,12 @@ Rutas:
 import logging
 import os
 import uuid
+from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 from app.models import ApiResponse
 from app.orchestrator import orchestrator
 from app.dispatcher import send_raw_command
+from app.sockets import emit_agent_event
 
 router = APIRouter(tags=["sentinel"])
 logger = logging.getLogger("cerebro.routes.sentinel")
@@ -38,17 +40,73 @@ _PRO_MESSAGES = {
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
+def _upsert_env(text: str, key: str, val: str) -> str:
+    """Reemplaza o agrega una variable en el archivo .env."""
+    import re
+    pattern = rf'^{key}=.*$'
+    replacement = f'{key}={val}'
+    if re.search(pattern, text, flags=re.MULTILINE):
+        return re.sub(pattern, replacement, text, flags=re.MULTILINE)
+    return text + f'\n{replacement}'
+
+
 @router.get("/sentinel/config", response_model=ApiResponse)
 async def get_sentinel_config():
+    """Retorna configuración de Sentinel incluyendo modo (core/adk)."""
+    from app.config import get_settings
+    s = get_settings()
+
     result = await orchestrator.get_sentinel_config()
     if isinstance(result, dict) and "error" in result:
         return ApiResponse(ok=False, message=result["error"])
+
+    # Agregar información de modo
+    result["sentinel_mode"] = s.sentinel_mode
+    result["sentinel_adk_url"] = s.sentinel_adk_url
+    result["active_url"] = s.sentinel_adk_url if s.sentinel_mode == "adk" else s.sentinel_url
+
     return ApiResponse(ok=True, data=result)
 
 
 @router.post("/sentinel/config", response_model=ApiResponse)
 async def save_sentinel_config(request: Request):
-    result = await orchestrator.save_sentinel_config(await request.json())
+    data = await request.json()
+
+    # Handle mode switch (core/adk) if provided
+    new_mode = data.get("sentinel_mode")
+    new_provider = data.get("sentinel_llm_provider")
+    ollama_url = data.get("ollama_base_url")
+    ollama_model = data.get("ollama_model")
+
+    if new_mode:
+        if new_mode not in ("core", "adk"):
+            raise HTTPException(status_code=400, detail="sentinel_mode debe ser 'core' o 'adk'")
+
+        env_path = Path(__file__).parent.parent.parent / ".env"
+        env_text = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+
+        env_text = _upsert_env(env_text, "SENTINEL_MODE", new_mode)
+        if new_provider:
+            env_text = _upsert_env(env_text, "SENTINEL_LLM_PROVIDER", new_provider)
+        if ollama_url:
+            env_text = _upsert_env(env_text, "OLLAMA_BASE_URL", ollama_url)
+        if ollama_model:
+            env_text = _upsert_env(env_text, "OLLAMA_MODEL", ollama_model)
+        env_path.write_text(env_text, encoding="utf-8")
+
+        await emit_agent_event({
+            "source": "sentinel", "type": "config_updated", "severity": "info",
+            "payload": {
+                "sentinel_mode": new_mode, "sentinel_llm_provider": new_provider,
+                "message": f"Sentinel → modo '{new_mode}'. Reinicia Cerebro para aplicar.",
+            },
+        })
+        return ApiResponse(ok=True,
+                           message=f"Guardado. Reinicia Cerebro para activar modo '{new_mode}'.",
+                           data={"sentinel_mode": new_mode})
+
+    # Legacy: save sentinel config via orchestrator
+    result = await orchestrator.save_sentinel_config(data)
     if result.get("status") == "error":
         return ApiResponse(ok=False, message=result.get("message"))
     return ApiResponse(ok=True, message="Configuración de Sentinel guardada exitosamente")
@@ -60,7 +118,8 @@ async def sentinel_init():
     result = await orchestrator.sentinel_init()
     if isinstance(result, dict) and "error" in result:
         return ApiResponse(ok=False, message=result["error"])
-    return ApiResponse(ok=True, message="Proceso de inicialización de Sentinel lanzado")
+    # Devolver también el wizard_id para que el frontend pueda hacer seguimiento
+    return ApiResponse(ok=True, message="Proceso de inicialización de Sentinel lanzado", data=result)
 
 
 # ─── Pro Command ──────────────────────────────────────────────────────────────
@@ -87,11 +146,13 @@ async def sentinel_command(request: Request):
     if isinstance(ack, dict) and ack.get("status") == "rejected":
         return ApiResponse(ok=False, message=ack.get("error", "Comando rechazado"))
 
+    # Emitir sentinel_ready la primera vez que Sentinel responde exitosamente
+    # (Esto asegura que el badge "ready" aparezca en el Dashboard)
     if not _ready["sentinel"]:
         _ready["sentinel"] = True
         await emit_agent_event({
             "source": "sentinel", "type": "sentinel_ready", "severity": "info",
-            "payload": {"ready": True, "message": "Sentinel está listo para monitoreo"},
+            "payload": {"ready": True, "message": "Sentinel Core está listo para análisis"},
         })
 
     result_status = "error" if (isinstance(ack, dict) and ack.get("status") == "error") else "completed"
@@ -190,3 +251,55 @@ async def sentinel_monitor_testing(request: Request):
 async def sentinel_monitor_reset_config(request: Request):
     ack = await _sentinel_monitor("reset-config", orchestrator.active_project, request)
     return ApiResponse(ok=True, message="Reinicio de configuración solicitado", data=ack)
+
+
+@router.get("/sentinel/memory", response_model=ApiResponse,
+             summary="Obtener contexto de memoria de Sentinel")
+async def get_sentinel_memory():
+    """Retorna datos históricos de análisis de Sentinel desde ContextDB."""
+    try:
+        # Obtener patrones y hallazgos recientes del ContextDB
+        patterns = orchestrator.context_db.get_recent_patterns(
+            source_filter="sentinel_analysis",
+            limit=20
+        )
+
+        # Construir lista de archivos calientes (hot files)
+        hot_files = []
+        file_scores = {}
+        for p in patterns:
+            fp = p.get("file_path")
+            if fp:
+                if fp not in file_scores:
+                    file_scores[fp] = {"count": 0, "severity": p.get("severity", "info"), "events": []}
+                file_scores[fp]["count"] += 1
+                file_scores[fp]["events"].append(p)
+
+        # Ordenar por frecuencia y severidad
+        sorted_files = sorted(file_scores.items(), key=lambda x: (x[1]["count"], x[1]["severity"]), reverse=True)
+        for fp, data in sorted_files[:10]:
+            hot_files.append({
+                "file_path": fp,
+                "total_events": data["count"],
+                "severity": data["severity"],
+            })
+
+        # Hallazgos críticos recientes
+        critical_findings = [
+            {
+                "event_type": p.get("pattern_type", "finding"),
+                "timestamp": p.get("created_at", ""),
+                "severity": p.get("severity", "info"),
+                "file": p.get("file_path", ""),
+            }
+            for p in patterns if p.get("severity") in ("critical", "error")
+        ][:5]
+
+        return ApiResponse(ok=True, data={
+            "hot_files": hot_files,
+            "recent_findings": critical_findings,
+            "total_patterns": len(patterns),
+        })
+    except Exception as e:
+        logger.exception("Error obteniendo memoria de Sentinel")
+        return ApiResponse(ok=False, message=str(e))

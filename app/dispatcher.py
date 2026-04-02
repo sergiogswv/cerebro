@@ -25,11 +25,19 @@ def _resolve_architect_url() -> str:
     return settings.architect_url
 
 
+def _resolve_sentinel_url() -> str:
+    if settings.sentinel_mode == "adk":
+        logger.info(f"🛡️ Sentinel en modo ADK → {settings.sentinel_adk_url}")
+        return settings.sentinel_adk_url
+    return settings.sentinel_url
+
+
 AGENT_URLS: dict[str, str] = {
-    "sentinel":  settings.sentinel_url,
-    "architect": _resolve_architect_url(),
-    "warden":    _resolve_warden_url(),
-    "ejecutor":  settings.executor_url,
+    "sentinel":     _resolve_sentinel_url(),
+    "sentinel_adk": settings.sentinel_adk_url,
+    "architect":    _resolve_architect_url(),
+    "warden":       _resolve_warden_url(),
+    "ejecutor":     settings.executor_url,
 }
 
 

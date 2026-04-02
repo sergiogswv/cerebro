@@ -111,6 +111,65 @@ async def get_ai_suggestions(project: str = None):
     return ApiResponse(ok=True, data=result)
 
 
+@router.get("/memory", response_model=ApiResponse,
+             summary="Obtener contexto de memoria de Architect")
+async def get_architect_memory():
+    """Retorna datos históricos de análisis de arquitectura desde ContextDB."""
+    try:
+        # Obtener patrones y hallazgos recientes del ContextDB
+        patterns = orchestrator.context_db.get_recent_patterns(
+            source_filter="architect_analysis",
+            limit=20
+        )
+
+        # Construir lista de archivos calientes (hot files)
+        hot_files = []
+        file_scores = {}
+        for p in patterns:
+            fp = p.get("file_path")
+            if fp:
+                if fp not in file_scores:
+                    file_scores[fp] = {"count": 0, "severity": p.get("severity", "info"), "events": []}
+                file_scores[fp]["count"] += 1
+                file_scores[fp]["events"].append(p)
+
+        # Ordenar por frecuencia y severidad
+        sorted_files = sorted(file_scores.items(), key=lambda x: (x[1]["count"], x[1]["severity"]), reverse=True)
+        for fp, data in sorted_files[:10]:
+            hot_files.append({
+                "file_path": fp,
+                "total_events": data["count"],
+                "severity": data["severity"],
+            })
+
+        # Hallazgos críticos recientes
+        critical_findings = [
+            {
+                "event_type": p.get("pattern_type", "finding"),
+                "timestamp": p.get("created_at", ""),
+                "severity": p.get("severity", "info"),
+                "file": p.get("file_path", ""),
+            }
+            for p in patterns if p.get("severity") in ("critical", "error")
+        ][:5]
+
+        # Calcular health score (simulado basado en patrones)
+        total_patterns = len(patterns)
+        critical_count = sum(1 for p in patterns if p.get("severity") == "critical")
+        error_count = sum(1 for p in patterns if p.get("severity") == "error")
+        health_score = max(0, 100 - (critical_count * 20) - (error_count * 10))
+
+        return ApiResponse(ok=True, data={
+            "hot_files": hot_files,
+            "recent_findings": critical_findings,
+            "health_score": health_score,
+            "total_patterns": total_patterns,
+        })
+    except Exception as e:
+        logger.exception("Error obteniendo memoria de Architect")
+        return ApiResponse(ok=False, message=str(e))
+
+
 @router.post("/command", response_model=ApiResponse,
              summary="Enviar comando a Architect")
 async def architect_command(request: Request):

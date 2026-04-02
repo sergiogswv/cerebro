@@ -325,25 +325,38 @@ async def consultar_ia(prompt: str, ai_config: AIConfig) -> Optional[str]:
 
             # OpenAI compatible (OpenAI, Groq, Ollama, Kimi, DeepSeek)
             else:
-                url = f"{ai_config.api_url.rstrip('/')}/chat/completions"
+                # Para Ollama, asegurar que la URL tenga /v1 si no la tiene
+                base_url = ai_config.api_url.rstrip('/')
+                if not base_url.endswith('/v1') and 'ollama' in ai_config.provider.lower():
+                    base_url = f"{base_url}/v1"
+                url = f"{base_url}/chat/completions"
+
+                logger.info(f"🔍 [consultar_ia] Ollama URL: {url}")
+                logger.info(f"🔍 [consultar_ia] Modelo: {ai_config.model}")
+
                 headers = {"content-type": "application/json"}
                 if ai_config.api_key:
                     headers["authorization"] = f"Bearer {ai_config.api_key}"
                 body = {
                     "model": ai_config.model,
                     "messages": [
-                        {"role": "system", "content": "Eres un Arquitecto de Software Senior."},
+                        {"role": "system", "content": "Eres un experto en frameworks de desarrollo."},
                         {"role": "user", "content": prompt}
                     ],
                     "temperature": 0.1
                 }
+                logger.info(f"🔍 [consultar_ia] Enviando request a {url}")
                 resp = await client.post(url, headers=headers, json=body)
+                logger.info(f"🔍 [consultar_ia] Status: {resp.status_code}")
                 resp.raise_for_status()
                 data = resp.json()
+                logger.info(f"🔍 [consultar_ia] Respuesta recibida: {str(data)[:200]}")
                 return data["choices"][0]["message"]["content"]
 
     except Exception as e:
-        logger.error(f"Error consultando IA ({ai_config.name}): {e}")
+        logger.error(f"🔍 [consultar_ia] Error consultando IA ({ai_config.name}): {e}")
+        import traceback
+        logger.error(f"🔍 [consultar_ia] Traceback: {traceback.format_exc()}")
         return None
 
 async def consultar_ia_con_fallback(prompt: str, configs: List[AIConfig]) -> Optional[str]:
@@ -352,19 +365,20 @@ async def consultar_ia_con_fallback(prompt: str, configs: List[AIConfig]) -> Opt
         logger.warning("⚠️ No hay configs de IA para consultar")
         return None
 
-    logger.info(f"🔍 consultar_ia_con_fallback: intentando con {len(configs)} config(s)")
+    logger.info(f"🔍 [consultar_ia_con_fallback] Iniciando con {len(configs)} config(s)")
 
-    for config in configs:
-        logger.info(f"🔍 Intentando con config: {config.name} ({config.provider}) - {config.api_url}")
+    for i, config in enumerate(configs):
+        logger.info(f"🔍 [consultar_ia_con_fallback] Config {i+1}/{len(configs)}: {config.name} ({config.provider}) - URL: {config.api_url} - Model: {config.model}")
         try:
             result = await consultar_ia(prompt, config)
             if result:
-                logger.info(f"✅ Modelo '{config.name}' respondió correctamente")
+                logger.info(f"✅ [consultar_ia_con_fallback] Config '{config.name}' respondió correctamente")
                 return result
-            logger.warning(f"❌ Modelo '{config.name}' falló (resultado None), intentando siguiente...")
+            logger.warning(f"❌ [consultar_ia_con_fallback] Config '{config.name}' retornó None")
         except Exception as e:
-            logger.error(f"❌ Modelo '{config.name}' lanzó excepción: {e}")
+            logger.error(f"❌ [consultar_ia_con_fallback] Config '{config.name}' lanzó excepción: {e}")
 
+    logger.error("🔍 [consultar_ia_con_fallback] TODAS las configs fallaron")
     return None
 
 def extraer_json_flexible(text: str) -> Optional[str]:
@@ -486,6 +500,58 @@ Genera 5-7 reglas de importaciones prohibidas."""
     except Exception as e:
         logger.error(f"Error parseando respuesta de IA: {e}")
         return None
+
+async def detectar_framework_con_ia(
+    project_path: str,
+    ai_configs: List[AIConfig]
+) -> Optional[str]:
+    """Detecta el framework del proyecto usando IA"""
+    context = get_project_context(project_path)
+
+    logger.info(f"🔍 [detectar_framework_con_ia] Iniciando detección para: {project_path}")
+    logger.info(f"🔍 [detectar_framework_con_ia] Configs disponibles: {len(ai_configs)}")
+    for cfg in ai_configs:
+        logger.info(f"🔍 [detectar_framework_con_ia] Config: {cfg.name} ({cfg.provider}) - {cfg.model} @ {cfg.api_url}")
+
+    prompt = f"""Eres un experto en tecnologías de desarrollo. Analiza la siguiente información de un proyecto y detecta el framework/librería principal.
+
+Información del proyecto:
+- Framework detectado por archivos: {context['framework']}
+- Dependencias principales: {', '.join(context['dependencies'][:20]) if context['dependencies'] else 'Ninguna'}
+- Estructura de carpetas: {', '.join(context['folder_structure'][:15]) if context['folder_structure'] else 'N/A'}
+- Archivos clave: {', '.join(context['key_files'][:10]) if context['key_files'] else 'Ninguno'}
+
+Responde EXACTAMENTE con el nombre del framework en una sola palabra o frase corta.
+Opciones comunes: Next.js, NestJS, React, Vue, Angular, Django, Flask, FastAPI, Laravel, Spring Boot, Gin, Express, Svelte, Remix, Nuxt.js, etc.
+
+Si no estás seguro, responde "unknown".
+
+Respuesta (solo el nombre del framework):"""
+
+    logger.info(f"🔍 [detectar_framework_con_ia] Enviando prompt a IA...")
+    try:
+        response_text = await consultar_ia_con_fallback(prompt, ai_configs)
+    except Exception as e:
+        logger.error(f"🔍 [detectar_framework_con_ia] ERROR en consultar_ia_con_fallback: {e}")
+        import traceback
+        logger.error(f"🔍 [detectar_framework_con_ia] Traceback: {traceback.format_exc()}")
+        return None
+
+    logger.info(f"🔍 [detectar_framework_con_ia] Respuesta recibida: {response_text[:200] if response_text else 'None'}")
+
+    if not response_text:
+        logger.warning("🔍 [detectar_framework_con_ia] No se recibió respuesta de la IA")
+        return None
+
+    # Limpiar la respuesta (quitar espacios, saltos de línea, etc.)
+    framework = response_text.strip().strip('"\'').split('\n')[0].strip()
+
+    logger.info(f"🔍 [detectar_framework_con_ia] Framework detectado: {framework}")
+
+    if framework and framework.lower() != 'unknown':
+        return framework
+
+    return None
 
 async def sugerir_arquitectura_inicial(
     context: Dict[str, Any],

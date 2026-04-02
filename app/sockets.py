@@ -64,23 +64,26 @@ async def emit_agent_event(event_data: dict):
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         }
 
-        # Guardar eventos de interacción para clientes que se conecten después
-        if event_data.get('type') == 'interaction_required':
-            pending_interaction_events.append(event_with_metadata)
-            logger.info(f"💾 Evento de interacción guardado (pendientes: {len(pending_interaction_events)})")
-        else:
-            # Para eventos normales, emitimos con metadata
-            event_data = event_with_metadata
-
-        # Guardar estado de readiness de los agentes
+        # Guardar estado de readiness de los agentes (antes de modificar event_data)
         if event_data.get('type') in ['sentinel_ready', 'architect_ready', 'warden_ready']:
             agent = event_data.get('source')
             if agent and agent in agent_ready_state:
                 agent_ready_state[agent] = True
                 logger.info(f"💾 Estado {agent}_ready guardado")
 
-        await sio.emit('agent_event', event_data)
-        logger.debug(f"📤 Evento emitido por Socket.IO: {event_data.get('type')}")
+        # Guardar eventos de interacción para clientes que se conecten después
+        # Y emitir inmediatamente a clientes conectados
+        if event_data.get('type') == 'interaction_required':
+            pending_interaction_events.append(event_with_metadata)
+            logger.info(f"💾 Evento de interacción guardado (pendientes: {len(pending_interaction_events)})")
+            # Emitir el evento CON metadata (id, timestamp)
+            await sio.emit('agent_event', event_with_metadata)
+            logger.info(f"📤 interaction_required emitido: step={event_with_metadata.get('payload', {}).get('wizard_step')}, prompt_id={event_with_metadata.get('payload', {}).get('prompt_id')}")
+        else:
+            # Para eventos normales, usamos metadata y emitimos
+            event_data = event_with_metadata
+            await sio.emit('agent_event', event_data)
+            logger.debug(f"📤 Evento emitido por Socket.IO: {event_data.get('type')}")
     except Exception as e:
         logger.error(f"❌ Error emitiendo por Socket.IO: {e}")
 

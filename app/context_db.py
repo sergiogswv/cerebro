@@ -16,6 +16,9 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 from pathlib import Path
 
+from app.vector_store import VectorStore
+from app.hybrid_query_engine import HybridQueryEngine
+
 logger = logging.getLogger("cerebro.context_db")
 
 
@@ -125,12 +128,13 @@ class ContextDB:
     Almacena historial de archivos, criticidad y patrones.
     """
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str] = None, vector_enabled: bool = True):
         """
         Inicializa la base de datos.
 
         Args:
             db_path: Ruta al archivo SQLite. Por defecto: ~/.cerebro/context.db
+            vector_enabled: Si True, intenta inicializar VectorStore
         """
         if db_path is None:
             cerebro_dir = Path.home() / ".cerebro"
@@ -143,6 +147,18 @@ class ContextDB:
 
         # Configurar criticidad por defecto
         self._init_default_criticality()
+
+        # Inicializar VectorStore (opcional)
+        self._vector_store: Optional[VectorStore] = None
+        self._hybrid_engine: Optional[HybridQueryEngine] = None
+
+        if vector_enabled:
+            try:
+                self._vector_store = VectorStore()
+                self._hybrid_engine = HybridQueryEngine(self, self._vector_store)
+                logger.info("VectorStore integrado en ContextDB")
+            except Exception as e:
+                logger.warning(f"No se pudo inicializar VectorStore: {e}")
 
         logger.info(f"🗄️ ContextDB inicializada: {db_path}")
 
@@ -367,6 +383,59 @@ class ContextDB:
 
         return patterns
 
+    def get_recent_patterns(
+        self,
+        source_filter: Optional[str] = None,
+        limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Obtiene los patrones detectados más recientes.
+
+        Args:
+            source_filter: Filtrar por tipo de patrón (opcional)
+            limit: Número máximo de patrones a retornar
+
+        Returns:
+            Lista de patrones detectados ordenados por last_seen DESC
+        """
+        conn = self._get_connection()
+
+        if source_filter:
+            cursor = conn.execute(
+                """
+                SELECT * FROM detected_patterns
+                WHERE pattern_type = ?
+                ORDER BY last_seen DESC
+                LIMIT ?
+                """,
+                (source_filter, limit)
+            )
+        else:
+            cursor = conn.execute(
+                """
+                SELECT * FROM detected_patterns
+                ORDER BY last_seen DESC
+                LIMIT ?
+                """,
+                (limit,)
+            )
+
+        patterns = []
+        for row in cursor:
+            patterns.append({
+                "id": row["id"],
+                "pattern_type": row["pattern_type"],
+                "file_path": row["file_path"],
+                "description": row["description"],
+                "severity": row["severity"],
+                "occurrences": row["occurrences"],
+                "first_seen": row["first_seen"],
+                "last_seen": row["last_seen"],
+                "metadata": json.loads(row["metadata"]) if row["metadata"] else None,
+            })
+
+        return patterns
+
     # ─────────────────────────────────────────────────────────────────────────
     # MÉTODOS DE REGISTRO DE EVENTOS
     # ─────────────────────────────────────────────���───────────────────────────
@@ -421,6 +490,28 @@ class ContextDB:
 
         conn.commit()
         logger.debug(f"📝 Evento registrado: {event_id} ({file_path}, {event_type}, {severity})")
+
+        # Indexar en VectorStore (async, no bloqueante)
+        if self._vector_store and self._vector_store.is_available():
+            try:
+                # Construir descripción para embedding
+                description = self._build_event_description(
+                    event_type, source, severity, file_path, payload
+                )
+
+                metadata = {
+                    "source": source,
+                    "severity": severity,
+                    "file_path": file_path,
+                    "timestamp": timestamp,
+                    "project": payload.get("project") if payload else None,
+                    "event_type": event_type
+                }
+
+                # Indexar (no bloqueante, si falla no afecta el evento)
+                self._vector_store.add_event(event_id, description, metadata)
+            except Exception as e:
+                logger.warning(f"No se pudo indexar evento en VectorStore: {e}")
 
         return event_id
 
@@ -972,6 +1063,121 @@ class ContextDB:
             "suggestions": suggestions,
             "auto_detected_outcomes": auto_detected_outcomes,
         }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # MÉTODOS DE BÚSQUEDA SEMÁNTICA
+    # ────��────────────────────────────────────────────────────────────────────
+
+    def _build_event_description(
+        self,
+        event_type: str,
+        source: str,
+        severity: str,
+        file_path: str,
+        payload: Optional[Dict]
+    ) -> str:
+        """Construye descripción textual del evento para embeddings."""
+        parts = [
+            f"Event Type: {event_type}",
+            f"Source: {source}",
+            f"Severity: {severity}",
+            f"File: {file_path}"
+        ]
+
+        if payload:
+            if payload.get("description"):
+                parts.append(f"Description: {payload['description']}")
+            if payload.get("message"):
+                parts.append(f"Message: {payload['message']}")
+            if payload.get("finding"):
+                parts.append(f"Finding: {payload['finding']}")
+            if payload.get("pattern_type"):
+                parts.append(f"Pattern: {payload['pattern_type']}")
+
+        return "\n".join(parts)
+
+    def semantic_search(
+        self,
+        query: str,
+        filters: Optional[Dict[str, Any]] = None,
+        limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Búsqueda semántica de eventos.
+
+        Args:
+            query: Texto de búsqueda natural (ej: "authentication bypass")
+            filters: Filtros opcionales {source, severity, project}
+            limit: Cantidad máxima de resultados
+
+        Returns:
+            Lista de eventos similares con metadata enriquecida
+
+        Note:
+            Requiere VectorStore inicializado. Si no está disponible,
+            retorna lista vacía.
+        """
+        if not self._hybrid_engine:
+            logger.warning("HybridQueryEngine no disponible, semantic_search no funciona")
+            return []
+
+        return self._hybrid_engine.semantic_search(query, filters, limit)
+
+    def find_similar_findings(
+        self,
+        event_id: str,
+        limit: int = 5
+    ) -> List[Dict[str, Any]]:
+        """
+        Encuentra hallazgos similares a un evento existente.
+
+        Args:
+            event_id: ID del evento de referencia
+            limit: Cantidad de resultados similares
+
+        Returns:
+            Lista de eventos similares con scores de similitud
+        """
+        if not self._hybrid_engine:
+            return []
+
+        return self._hybrid_engine.find_similar_findings(event_id, limit)
+
+    def get_file_clusters(
+        self,
+        project: Optional[str] = None,
+        min_cluster_size: int = 3
+    ) -> List[Dict[str, Any]]:
+        """
+        Clustering de archivos por similitud semántica.
+
+        Agrupa archivos que tienen eventos similares conceptualmente.
+
+        Args:
+            project: Filtrar por proyecto específico
+            min_cluster_size: Tamaño mínimo de cluster a retornar
+
+        Returns:
+            Lista de clusters con archivos y tópico representativo
+
+        Example:
+            [
+                {
+                    "cluster_id": 0,
+                    "files": ["/auth/login.py", "/auth/oauth.py"],
+                    "file_count": 2,
+                    "topic": "auth-oauth"
+                }
+            ]
+        """
+        if not self._hybrid_engine:
+            return []
+
+        return self._hybrid_engine.get_file_clusters(project, min_cluster_size)
+
+    def is_vector_available(self) -> bool:
+        """Retorna True si VectorStore está disponible y funcionando."""
+        return self._vector_store is not None and self._vector_store.is_available()
 
 
 # Instancia global (lazy initialization)

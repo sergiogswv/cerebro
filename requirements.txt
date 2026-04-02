@@ -7,3 +7,11 @@ python-dotenv
 python-socketio
 psutil
 toml
+
+# Vector DB (optional - semantic search)
+chromadb>=0.4.22
+sentence-transformers>=2.2.2
+
+# Clustering (optional - for file clustering)
+scikit-learn>=1.3.0
+numpy>=1.24.0

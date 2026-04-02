@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     architect_mode: str = "core"  # "core" | "adk"
     architect_adk_url: str = "http://127.0.0.1:4012"
 
+    # Sentinel — modo de operación
+    # "core"  → llama directamente al Sentinel Core Rust (:4001)
+    # "adk"   → llama al sidecar Python con LLM + memoria (:4011)
+    sentinel_mode: str = "core"  # "core" | "adk"
+    sentinel_adk_url: str = "http://127.0.0.1:4011"
+
     # LLM para el sidecar Warden ADK
     # gemini | claude | openai  (debe coincidir con LLM_PROVIDER en warden_agent/.env)
     warden_llm_provider: str = "gemini"

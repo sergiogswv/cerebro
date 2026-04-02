@@ -1,93 +1,586 @@
-import os
+"""
+routes/config.py — Unified configuration API endpoints.
+
+These endpoints provide access to the global unified configuration system
+that manages settings for Sentinel, Architect, and Warden agents.
+
+Routes:
+  GET  /config                   → Get full unified config
+  GET  /config/{agent_name}      → Get agent config with resolved values
+  POST /config/{agent_name}      → Update agent config
+  GET  /config/{agent_name}/llm  → Get resolved LLM config for agent
+  POST /config/{agent_name}/llm  → Update agent LLM config
+  POST /config/global            → Update global config
+  POST /config/reload            → Reload config from disk
+"""
+
 import json
 import logging
+import os
 from pathlib import Path
+from typing import Any, Dict, Literal, Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
-from typing import Dict, Any
 
 from app.models import ApiResponse
+from app.config_manager import UnifiedConfigManager
+from app.models.config import LLMConfig
 
 router = APIRouter(tags=["config"])
 logger = logging.getLogger("cerebro.routes.config")
 
-CONFIG_FILE = Path("cerebro_settings.json")
+# Valid agent names
+VALID_AGENTS = {"sentinel", "architect", "warden"}
 
-def load_config() -> Dict[str, Any]:
-    default_config = {
-        "auto_fix_enabled": True,
-        "auto_fix_provider": "ollama",
-        "auto_fix_model": "qwen3:8b",
-        "require_approval_critical": True,
-        "isolation_branch_prefix": "skrymir-fix/",
-        "notifier_timeout_mins": 30,
-        "chain_fallback_behavior": "branch_and_wait",
-        "auto_fix_max_retries": 3,
-        "warden_mode": "core", # "core" | "adk"
-        "warden_adk_url": "http://127.0.0.1:4013",
-        "architect_mode": "core", # "core" | "adk"
-        "architect_adk_url": "http://127.0.0.1:4012",
-    }
 
-    if not CONFIG_FILE.exists():
-        return default_config
+def _log_debug(msg: str):
+    """Log debug a archivo para poder ver sin consola."""
+    log_file = Path.home() / ".cerebro" / "debug.log"
+    try:
+        with open(log_file, "a", encoding="utf-8") as f:
+            from datetime import datetime
+            f.write(f"{datetime.now().isoformat()} - {msg}\n")
+    except:
+        pass
+    logger.info(msg)
+
+
+def _sync_legacy_config_files(agent_name: str, llm_config: Any, project_path: Optional[str] = None):
+    """
+    Sincroniza la configuración de LLM con los archivos legacy del proyecto.
+
+    Genera:
+    - .architect.ai.json para architect
+    - .sentinelrc.toml para sentinel (sección [llm])
+
+    Args:
+        agent_name: Nombre del agente (sentinel, architect, warden)
+        llm_config: Configuración resuelta del LLM
+        project_path: Ruta al proyecto (opcional, usa active_project del orchestrator si no se provee)
+    """
+    _log_debug(f"[Legacy Sync] INICIANDO para {agent_name}")
+
+    if not project_path:
+        # Intentar obtener el proyecto activo del orchestrator
+        try:
+            from app.orchestrator import orchestrator
+            logger.info(f"[Legacy Sync] Orchestrator active_project: {orchestrator.active_project}")
+            logger.info(f"[Legacy Sync] Orchestrator workspace_root: {orchestrator.workspace_root}")
+            if orchestrator.active_project:
+                project_path = os.path.join(orchestrator.workspace_root, orchestrator.active_project)
+                logger.info(f"[Legacy Sync] Project path calculado: {project_path}")
+            else:
+                _log_debug(f"[Legacy Sync] No hay proyecto activo en orchestrator")
+                return
+        except Exception as e:
+            _log_debug(f"[Legacy Sync] Error obteniendo orchestrator: {e}")
+            return
+
+    if not project_path:
+        _log_debug("[Legacy Sync] project_path es None")
+        return
+
+    if not os.path.exists(project_path):
+        _log_debug(f"[Legacy Sync] La ruta del proyecto no existe: {project_path}")
+        return
+
+    _log_debug(f"[Legacy Sync] Proyecto existe: {project_path}, sincronizando {agent_name}")
 
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            # Merge with defaults to ensure all keys exist
-            return {**default_config, **data}
+        # Convertir objeto Pydantic a dict si es necesario
+        if hasattr(llm_config, 'model_dump'):
+            llm_dict = llm_config.model_dump()
+        elif hasattr(llm_config, 'dict'):
+            llm_dict = llm_config.dict()
+        else:
+            llm_dict = dict(llm_config)
+
+        if agent_name == "architect":
+            # Generar .architect.ai.json
+            ai_config_path = os.path.join(project_path, ".architect.ai.json")
+
+            # Mapear provider de unified config a formato legacy
+            provider_mapping = {
+                "ollama": "Ollama",
+                "openai": "OpenAI",
+                "gemini": "Gemini",
+                "claude": "Claude"
+            }
+            legacy_provider = provider_mapping.get(llm_dict.get("provider", ""), "Ollama")
+
+            legacy_config = {
+                "configs": [{
+                    "name": f"{legacy_provider} (from Global Config)",
+                    "provider": legacy_provider,
+                    "api_url": llm_dict.get("base_url", ""),
+                    "api_key": llm_dict.get("api_key", ""),
+                    "model": llm_dict.get("model", "")
+                }],
+                "selected_name": f"{legacy_provider} (from Global Config)"
+            }
+
+            with open(ai_config_path, "w", encoding="utf-8") as f:
+                json.dump(legacy_config, f, indent=2)
+
+            _log_debug(f"✅ Archivo legacy creado: {ai_config_path}")
+
+        elif agent_name == "sentinel":
+            # Crear o actualizar .sentinelrc.toml
+            sentinel_path = os.path.join(project_path, ".sentinelrc.toml")
+            try:
+                import toml
+
+                # Cargar config existente o crear nueva estructura por defecto
+                if os.path.exists(sentinel_path):
+                    with open(sentinel_path, "r", encoding="utf-8") as f:
+                        config = toml.load(f)
+                    _log_debug(f"[Legacy Sync] Archivo existente cargado: {sentinel_path}")
+                else:
+                    # Crear estructura por defecto para Sentinel
+                    config = {
+                        "sentinel": {
+                            "mode": "core",
+                            "auto_sync": True,
+                            "memory_enabled": True
+                        },
+                        "monitor": {
+                            "file_watcher": True,
+                            "http_health_check": False
+                        }
+                    }
+                    _log_debug(f"[Legacy Sync] Creando nuevo archivo: {sentinel_path}")
+
+                # Actualizar sección [llm] con valores de global config
+                config["llm"] = {
+                    "provider": llm_dict.get("provider", "ollama"),
+                    "model": llm_dict.get("model", ""),
+                    "base_url": llm_dict.get("base_url", ""),
+                    "api_key": llm_dict.get("api_key", "")
+                }
+
+                with open(sentinel_path, "w", encoding="utf-8") as f:
+                    toml.dump(config, f)
+
+                action = "actualizado" if os.path.exists(sentinel_path) else "creado"
+                _log_debug(f"✅ Archivo legacy {action}: {sentinel_path}")
+            except Exception as e:
+                _log_debug(f"No se pudo crear/actualizar {sentinel_path}: {e}")
+
     except Exception as e:
-        logger.error(f"Error cargando {CONFIG_FILE}: {e}")
-        return default_config
+        _log_debug(f"Error sincronizando archivos legacy: {e}")
 
-def save_config(config_data: Dict[str, Any]):
+
+# ─── Request/Response Models ──────────────────────────────────────────────────
+
+class UpdateAgentConfigRequest(BaseModel):
+    """Request body for updating agent configuration."""
+    config: Dict[str, Any]
+
+
+class UpdateGlobalConfigRequest(BaseModel):
+    """Request body for updating global configuration."""
+    model_config = {"extra": "ignore"}  # Ignore extra fields
+
+    llm: Dict[str, Any] | None = None
+    mode: Dict[str, str] | None = None
+
+
+class UpdateLLMConfigRequest(BaseModel):
+    """Request body for updating LLM configuration."""
+    provider: Literal["ollama", "openai", "gemini", "claude", "custom"] | None = None
+    model: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+
+
+# ─── Helper Functions ─────────────────────────────────────────────────────────
+
+def _get_config_manager() -> UnifiedConfigManager:
+    """Get the singleton config manager instance."""
+    return UnifiedConfigManager.get_instance()
+
+
+def _validate_agent_name(agent_name: str) -> None:
+    """Validate agent name and raise 400 if invalid."""
+    if agent_name not in VALID_AGENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid agent_name: '{agent_name}'. Must be one of: {', '.join(sorted(VALID_AGENTS))}"
+        )
+
+
+# ─── Config Endpoints ─────────────────────────────────────────────────────────
+
+@router.get("/config/debug", response_model=ApiResponse, summary="Debug info for legacy sync")
+async def debug_legacy_sync():
+    """Endpoint de debug para verificar el estado del legacy sync."""
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config_data, f, indent=4)
+        from app.orchestrator import orchestrator
+
+        info = {
+            "active_project": orchestrator.active_project,
+            "workspace_root": orchestrator.workspace_root,
+            "log_file": str(Path.home() / ".cerebro" / "debug.log"),
+        }
+
+        # Verificar si existe el archivo debug.log
+        log_path = Path.home() / ".cerebro" / "debug.log"
+        if log_path.exists():
+            with open(log_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                info["last_logs"] = lines[-20:] if len(lines) > 20 else lines
+        else:
+            info["last_logs"] = ["No log file yet"]
+
+        return ApiResponse(ok=True, data=info)
     except Exception as e:
-        logger.error(f"Error guardando {CONFIG_FILE}: {e}")
-        raise
+        return ApiResponse(ok=False, message=str(e))
 
-@router.get("/config", response_model=ApiResponse, summary="Obtener config global de Cerebro (modo agentes)")
-async def get_config():
-    """Retorna configuración clave: modos de agentes (core/adk)"""
-    config = load_config()
-    return ApiResponse(ok=True, message="Configuración obtenida", data={
-        "architect_mode": config.get("architect_mode", "core"),
-        "warden_mode": config.get("warden_mode", "core"),
-        "auto_fix_enabled": config.get("auto_fix_enabled", True),
-        "auto_fix_provider": config.get("auto_fix_provider", "ollama"),
-    })
 
-@router.get("/config/cerebro", response_model=ApiResponse, summary="Obtener config global completa de Cerebro")
-async def get_cerebro_config():
-    config = load_config()
-    return ApiResponse(ok=True, message="Configuración obtenida", data={"config": config})
+@router.get("/config", response_model=ApiResponse, summary="Get full unified configuration")
+async def get_full_config():
+    """Returns the complete unified configuration as JSON.
 
-@router.post("/config/cerebro", response_model=ApiResponse, summary="Guardar config global de Cerebro")
-async def set_cerebro_config(request: Request):
+    Includes global config, agent-specific configs, and project overrides.
+    """
     try:
+        manager = _get_config_manager()
+        config = manager.get_full_config()
+        return ApiResponse(
+            ok=True,
+            message="Configuration retrieved successfully",
+            data=config
+        )
+    except Exception as e:
+        logger.exception("Error retrieving configuration")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/config/global", response_model=ApiResponse, summary="Update global configuration")
+async def update_global_config_endpoint(request: Request):
+    """Update the global configuration section.
+
+    Body:
+        llm: Optional dictionary with global LLM settings
+        mode: Optional dictionary mapping agent names to modes
+
+    Only provided fields are updated; others remain unchanged.
+    """
+    try:
+        # Parse raw body for debugging
         body = await request.json()
-        new_config = body.get("config")
-        if not new_config:
-            raise HTTPException(status_code=400, detail="Falta el campo 'config'")
-        
-        # Merge con lo existente
-        current = load_config()
-        updated = {**current, **new_config}
-        
-        save_config(updated)
-        
-        # Aquí podrías inyectar la config actualizada al Orchestrator o DecisionEngine en caliente
-        # from app.orchestrator import orchestrator
-        # orchestrator.settings.update(updated)
-        
-        logger.info("⚙️ Configuración global de Cerebro actualizada")
-        return ApiResponse(ok=True, message="Configuración guardada", data={"config": updated})
-        
+        logger.debug(f"Received global config update: {body}")
+
+        # Validate manually
+        try:
+            validated = UpdateGlobalConfigRequest(**body)
+        except Exception as ve:
+            logger.error(f"Validation error: {ve}")
+            raise HTTPException(status_code=422, detail=f"Validation error: {ve}")
+
+        manager = _get_config_manager()
+        unified_config = manager.get_config()
+
+        # Get current global config
+        current_global = unified_config.global_config.copy()
+
+        # Update with provided values
+        update_dict = validated.model_dump(exclude_unset=True, exclude_none=True)
+        new_global = {**current_global, **update_dict}
+
+        # Save via manager
+        manager.update_global_config(new_global)
+
+        # Sincronizar archivos legacy para todos los agentes
+        _log_debug("[Global Config] Iniciando sincronización legacy para todos los agentes")
+        for agent in VALID_AGENTS:
+            try:
+                agent_llm = manager.get_agent_llm_config(agent)
+                _log_debug(f"[Global Config] LLM para {agent}: {agent_llm}")
+                if agent_llm:
+                    _sync_legacy_config_files(agent, agent_llm)
+            except Exception as e:
+                _log_debug(f"[Global Config] Error sincronizando {agent}: {e}")
+
+        _log_debug("Global configuration updated")
+        return ApiResponse(
+            ok=True,
+            message="Global configuration updated",
+            data={"global_config": new_global}
+        )
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Error guardando config")
+        logger.exception("Error updating global configuration")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/config/{agent_name}", response_model=ApiResponse, summary="Get agent configuration")
+async def get_agent_config(agent_name: str):
+    """Returns agent-specific configuration with resolved LLM and mode.
+
+    Path parameters:
+        agent_name: sentinel, architect, or warden
+
+    Response includes:
+        - config: The agent's specific configuration
+        - resolved_llm: The effective LLM config (agent-specific or global fallback)
+        - resolved_mode: The effective mode (agent-specific or global fallback)
+    """
+    _validate_agent_name(agent_name)
+
+    try:
+        manager = _get_config_manager()
+        unified_config = manager.get_config()
+
+        # Get agent-specific config
+        agent_config = unified_config.agents.get(agent_name)
+        if agent_config is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Configuration not found for agent: {agent_name}"
+            )
+
+        # Get resolved LLM and mode
+        resolved_llm = manager.get_agent_llm_config(agent_name)
+        resolved_mode = manager.get_agent_mode(agent_name)
+
+        return ApiResponse(
+            ok=True,
+            message=f"Configuration retrieved for {agent_name}",
+            data={
+                "agent_name": agent_name,
+                "config": agent_config.model_dump(mode="json"),
+                "resolved_llm": resolved_llm.model_dump(mode="json") if resolved_llm else None,
+                "resolved_mode": resolved_mode
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Error retrieving configuration for {agent_name}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/config/{agent_name}", response_model=ApiResponse, summary="Update agent configuration")
+async def update_agent_config(agent_name: str, request: UpdateAgentConfigRequest):
+    """Update configuration for a specific agent.
+
+    Path parameters:
+        agent_name: sentinel, architect, or warden
+
+    Body:
+        config: Dictionary with agent configuration values
+
+    The new configuration is merged with existing values and saved to disk.
+    The cache is invalidated after update.
+    """
+    _validate_agent_name(agent_name)
+
+    try:
+        manager = _get_config_manager()
+
+        # Get current config for merging
+        unified_config = manager.get_config()
+        current_config = unified_config.agents.get(agent_name)
+
+        if current_config is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Configuration not found for agent: {agent_name}"
+            )
+
+        # Merge configurations
+        current_dict = current_config.model_dump()
+        merged_dict = {**current_dict, **request.config}
+
+        # Update via manager
+        manager.update_agent_config(agent_name, merged_dict)
+
+        logger.info(f"Configuration updated for agent: {agent_name}")
+        return ApiResponse(
+            ok=True,
+            message=f"Configuration updated for {agent_name}",
+            data={"agent_name": agent_name}
+        )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        logger.warning(f"Validation error updating config for {agent_name}: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception(f"Error updating configuration for {agent_name}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/config/{agent_name}/llm", response_model=ApiResponse, summary="Get resolved LLM configuration")
+async def get_agent_llm_config(agent_name: str):
+    """Returns the resolved LLM configuration for an agent.
+
+    Path parameters:
+        agent_name: sentinel, architect, or warden
+
+    The resolved configuration considers:
+    1. Agent-specific LLM config
+    2. Global LLM config (fallback)
+    3. Default values (final fallback)
+    """
+    _validate_agent_name(agent_name)
+
+    try:
+        manager = _get_config_manager()
+        llm_config = manager.get_agent_llm_config(agent_name)
+
+        return ApiResponse(
+            ok=True,
+            message=f"LLM configuration retrieved for {agent_name}",
+            data={
+                "agent_name": agent_name,
+                "llm_config": llm_config.model_dump(mode="json")
+            }
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception(f"Error retrieving LLM configuration for {agent_name}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/config/{agent_name}/llm", response_model=ApiResponse, summary="Update agent LLM configuration")
+async def update_agent_llm_config(agent_name: str, request: UpdateLLMConfigRequest):
+    """Update the LLM configuration for a specific agent.
+
+    Path parameters:
+        agent_name: sentinel, architect, or warden
+
+    Body: LLMConfig fields (all optional)
+        - provider: ollama, openai, gemini, claude, custom
+        - model: Model name
+        - base_url: API base URL
+        - api_key: API key (supports ${ENV_VAR} pattern)
+        - temperature: Sampling temperature (0.0-2.0)
+        - max_tokens: Maximum tokens to generate
+
+    Only provided fields are updated; others remain unchanged.
+    """
+    _validate_agent_name(agent_name)
+
+    try:
+        manager = _get_config_manager()
+        unified_config = manager.get_config()
+
+        # Get current agent config
+        agent_config = unified_config.agents.get(agent_name)
+        if agent_config is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Configuration not found for agent: {agent_name}"
+            )
+
+        # Build new LLM config from request
+        # Start with existing LLM or empty dict
+        current_llm = agent_config.llm.model_dump() if agent_config.llm else {}
+
+        # Update with provided values
+        update_dict = request.model_dump(exclude_unset=True, exclude_none=True)
+        new_llm_dict = {**current_llm, **update_dict}
+
+        # Create LLMConfig to validate
+        new_llm = LLMConfig(**new_llm_dict)
+
+        # Update agent config with new LLM
+        agent_dict = agent_config.model_dump()
+        agent_dict["llm"] = new_llm.model_dump()
+
+        # Save via manager
+        manager.update_agent_config(agent_name, agent_dict)
+
+        # Sincronizar archivos legacy del proyecto
+        try:
+            resolved_llm = manager.get_agent_llm_config(agent_name)
+            if resolved_llm:
+                _sync_legacy_config_files(agent_name, resolved_llm)
+        except Exception as e:
+            logger.debug(f"No se pudo sincronizar config legacy: {e}")
+
+        logger.info(f"LLM configuration updated for agent: {agent_name}")
+        return ApiResponse(
+            ok=True,
+            message=f"LLM configuration updated for {agent_name}",
+            data={
+                "agent_name": agent_name,
+                "llm_config": new_llm.model_dump(mode="json")
+            }
+        )
+    except HTTPException:
+        raise
+    except ValueError as e:
+        logger.warning(f"Validation error updating LLM config for {agent_name}: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception(f"Error updating LLM configuration for {agent_name}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/config/reload", response_model=ApiResponse, summary="Reload configuration from disk")
+async def reload_config():
+    """Reload configuration from disk and clear cache.
+
+    Use this endpoint when the configuration file may have been
+    modified externally to force a fresh load.
+    """
+    try:
+        manager = _get_config_manager()
+        manager.reload()
+
+        logger.info("Configuration reloaded from disk")
+        return ApiResponse(
+            ok=True,
+            message="Configuration reloaded from disk",
+            data=None
+        )
+    except Exception as e:
+        logger.exception("Error reloading configuration")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Legacy Compatibility Endpoints ───────────────────────────────────────────
+
+@router.get("/config/cerebro", response_model=ApiResponse, summary="[Legacy] Get cerebro settings")
+async def get_cerebro_config_legacy():
+    """Legacy endpoint for backward compatibility.
+
+    Returns configuration in the old format for existing clients.
+    Consider migrating to /config endpoint.
+    """
+    try:
+        manager = _get_config_manager()
+        unified_config = manager.get_config()
+
+        # Build legacy-compatible response
+        legacy_config = {
+            "architect_mode": manager.get_agent_mode("architect"),
+            "warden_mode": manager.get_agent_mode("warden"),
+            "sentinel_mode": manager.get_agent_mode("sentinel"),
+            "auto_fix_enabled": True,  # Default values for legacy compatibility
+            "auto_fix_provider": "ollama",
+            "auto_fix_model": "qwen3:8b",
+        }
+
+        # Add LLM info if available
+        for agent in VALID_AGENTS:
+            llm_config = manager.get_agent_llm_config(agent)
+            if llm_config:
+                legacy_config[f"{agent}_llm_provider"] = llm_config.provider
+                legacy_config[f"{agent}_llm_model"] = llm_config.model
+
+        return ApiResponse(
+            ok=True,
+            message="Configuration retrieved (legacy format)",
+            data={"config": legacy_config}
+        )
+    except Exception as e:
+        logger.exception("Error retrieving legacy configuration")
         raise HTTPException(status_code=500, detail=str(e))

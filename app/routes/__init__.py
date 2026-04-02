@@ -26,7 +26,7 @@ from .config    import router as config_router
 router = APIRouter(prefix="/api", tags=["api"])
 router.include_router(core_router)
 router.include_router(architect_router, prefix="/architect")
-router.include_router(sentinel_router, prefix="/sentinel")
+router.include_router(sentinel_router)  # El prefijo /sentinel ya está en las rutas del router
 router.include_router(warden_router, prefix="/warden")
 router.include_router(learning_router, prefix="/cerebro")
 router.include_router(config_router)

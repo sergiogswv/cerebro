@@ -17,6 +17,11 @@ import uuid
 
 logger = logging.getLogger("cerebro.change_manager")
 
+# Importar para enviar comandos al Executor y emitir eventos
+from app.dispatcher import send_command
+from app.models import OrchestratorCommand
+from app.sockets import emit_agent_event
+
 
 class ChangeStatus(Enum):
     """Estados de un cambio pendiente"""
@@ -297,6 +302,12 @@ class ChangeManager:
                         "file_path": change.file_path,
                         "status": result["status"],
                         "message": result.get("message", ""),
+                        # Campos adicionales de trazabilidad
+                        "branch": result.get("branch"),
+                        "files_modified": result.get("files_modified", 0),
+                        "modified_files": result.get("modified_files", []),
+                        "suggested_count": result.get("suggested_count", 0),
+                        "suggested_files": result.get("suggested_files", []),
                     })
 
                     # Actualizar estado
@@ -398,37 +409,159 @@ class ChangeManager:
 
     async def _apply_single_change(self, change: PendingChange) -> Dict[str, Any]:
         """
-        Aplica un cambio individual.
-        Aquí iría la lógica específica de aplicación.
+        Aplica un cambio individual enviándolo al Executor para ejecución vía Aider.
 
         Args:
             change: Cambio a aplicar
 
         Returns:
-            Dict: Resultado de la aplicación
+            Dict: Resultado de la aplicación con info de archivos modificados, build, etc.
         """
         logger.info(f"🔧 Aplicando cambio: {change.id} ({change.file_path})")
 
-        # TODO: Implementar lógica específica de aplicación
-        # Por ahora, simulamos éxito
+        try:
+            # Construir el comando para el Executor
+            instruction = f"""You are the Skrymir Executor Auto-Fix Agent.
+An upstream analysis agent has detected an issue in the codebase.
 
-        # Si hay recomendación, podríamos usar Architect para generar el fix
-        if change.recommendation and self._orchestrator:
-            # Futuro: llamar a Architect para generar código
-            logger.debug(f"  ↳ Recomendación: {change.recommendation}")
+=== ISSUE DESCRIPTION ===
+{change.description}
 
-        return {
-            "status": "success",
-            "message": f"Cambio aplicado en {change.file_path}",
-        }
+=== RECOMMENDATION ===
+{change.recommendation or 'Fix the identified issue'}
+
+YOUR TASK:
+Implement the exact code changes to resolve the identified issue.
+Focus strictly on the mentioned problem. Do not refactor unrelated code.
+"""
+
+            fix_cmd = OrchestratorCommand(
+                action="autofix",
+                target=change.file_path,
+                options={
+                    "instruction": instruction,
+                    "branch_prefix": "skrymir-fix/",
+                    "provider": "ollama",
+                    "model": "qwen3:8b",
+                }
+            )
+
+            # Emitir evento: enviando a Executor
+            await emit_agent_event({
+                "source": "cerebro",
+                "type": "executor_command_sent",
+                "severity": "info",
+                "payload": {
+                    "change_id": change.id,
+                    "file_path": change.file_path,
+                    "target": "ejecutor",
+                    "action": "autofix",
+                }
+            })
+
+            logger.info(f"  ↳ Enviando a Executor: autofix para {change.file_path}")
+
+            # Enviar comando al Executor
+            ack = await send_command("ejecutor", fix_cmd)
+
+            # Procesar resultado
+            fix_result = {}
+            if ack and isinstance(ack, dict):
+                fix_result = ack.get("data", {}).get("result", {}) or {}
+
+            fix_validated = fix_result.get("fix_validated")
+            branch = fix_result.get("branch", "unknown")
+            modified_files = fix_result.get("modified_files", [])
+            suggested_files = fix_result.get("suggested_files", [])
+            build_exit_code = fix_result.get("build_exit_code")
+            build_tool = fix_result.get("build_tool")
+
+            # Emitir evento de resultado
+            await emit_agent_event({
+                "source": "cerebro",
+                "type": "change_applied",
+                "severity": "info" if fix_validated is True else "warning",
+                "payload": {
+                    "change_id": change.id,
+                    "file_path": change.file_path,
+                    "fix_validated": fix_validated,
+                    "branch": branch,
+                    "build_exit_code": build_exit_code,
+                    "build_tool": build_tool,
+                    "files_modified": len(modified_files),
+                    "modified_files": modified_files,
+                    "suggested_count": len(suggested_files),
+                    "suggested_files": suggested_files,
+                }
+            })
+
+            if fix_validated is True:
+                logger.info(f"  ✅ Cambio aplicado exitosamente en rama {branch}")
+                return {
+                    "status": "success",
+                    "message": f"Cambio aplicado exitosamente en {change.file_path}",
+                    "branch": branch,
+                    "files_modified": len(modified_files),
+                    "modified_files": modified_files,
+                }
+            elif fix_validated is False:
+                logger.warning(f"  ⚠️ Build falló para {change.file_path}")
+                return {
+                    "status": "failed",
+                    "message": f"Build falló al aplicar cambio en {change.file_path}. Archivos .suggested creados.",
+                    "branch": branch,
+                    "build_exit_code": build_exit_code,
+                    "suggested_count": len(suggested_files),
+                    "suggested_files": suggested_files,
+                }
+            else:
+                logger.info(f"  ℹ️ Cambio aplicado sin validación de build")
+                return {
+                    "status": "partial",
+                    "message": f"Cambio aplicado en {change.file_path} (sin build tool detectado)",
+                    "branch": branch,
+                    "files_modified": len(modified_files),
+                }
+
+        except Exception as e:
+            logger.error(f"  ❌ Error aplicando cambio: {e}")
+            return {
+                "status": "error",
+                "message": f"Error aplicando cambio: {str(e)}",
+            }
 
     async def _notify_application_result(self, results: List[Dict]):
-        """Notifica el resultado de la aplicación de cambios"""
+        """Notifica el resultado de la aplicación de cambios con detalle de archivos"""
         success_count = sum(1 for r in results if r["status"] == "success")
+        failed_count = sum(1 for r in results if r["status"] == "failed")
+        error_count = sum(1 for r in results if r["status"] == "error")
         total = len(results)
 
+        # Contar archivos modificados y suggested
+        total_files_modified = sum(r.get("files_modified", 0) for r in results)
+        total_suggested = sum(r.get("suggested_count", 0) for r in results)
+
         message = f"{'✅' if success_count == total else '⚠️'} **CAMBIOS APLICADOS**\n\n"
-        message += f"Resultado: {success_count}/{total} exitosos\n\n"
+        message += f"Resultado: {success_count}/{total} exitosos\n"
+        message += f"Archivos modificados: {total_files_modified}\n"
+        if total_suggested > 0:
+            message += f"⚠️ Archivos .suggested creados: {total_suggested}\n"
+        message += "\n"
+
+        # Mostrar exitosos con detalle
+        succeeded = [r for r in results if r["status"] == "success"]
+        if succeeded:
+            message += "**Exitosos:**\n"
+            for r in succeeded:
+                branch = r.get('branch', 'unknown')
+                files = r.get('files_modified', 0)
+                message += f"• `{r.get('file_path', 'unknown')}`"
+                if branch != 'unknown':
+                    message += f" → rama `{branch}`"
+                if files > 0:
+                    message += f" ({files} archivos)"
+                message += "\n"
+            message += "\n"
 
         # Mostrar fallidos
         failed = [r for r in results if r["status"] != "success"]
@@ -436,20 +569,26 @@ class ChangeManager:
             message += "**Fallidos:**\n"
             for r in failed:
                 message += f"• `{r.get('file_path', 'unknown')}`: {r.get('message', 'Error desconocido')}\n"
+                if r.get('suggested_count', 0) > 0:
+                    suggested = r.get('suggested_files', [])
+                    message += f"  📝 Archivos .suggested creados: {', '.join(suggested[:3])}\n"
 
         from app.dispatcher import notify
         await notify(message, level="info" if success_count == total else "warning", source="cerebro")
 
-        # Emitir evento para dashboard
+        # Emitir evento para dashboard con info completa
         from app.sockets import emit_agent_event
         await emit_agent_event({
             "source": "cerebro",
             "type": "changes_applied",
-            "severity": "info",
+            "severity": "info" if success_count == total else "warning",
             "payload": {
                 "total": total,
                 "success": success_count,
-                "failed": total - success_count,
+                "failed": failed_count,
+                "error": error_count,
+                "files_modified": total_files_modified,
+                "suggested_count": total_suggested,
                 "results": results,
             }
         })
