@@ -64,18 +64,32 @@ class EventRouter:
                     project_root = getattr(self, '_active_project', None)
                     workspace = get_settings().workspace_root
                     
+                    target_abs = target if target and os.path.isabs(target) else os.path.join(workspace, target) if target else workspace
+                    
                     if project_root and project_root != "default":
                         repo_dir = os.path.join(workspace, project_root)
+                    elif target and os.path.isdir(target_abs):
+                        repo_dir = target_abs
+                    elif target:
+                        repo_dir = os.path.dirname(target_abs)
                     else:
+                        repo_dir = workspace
+
+                    if not os.path.isdir(repo_dir):
                         repo_dir = workspace
                         
                     logger.info(f"🌿 Iniciando MERGE AUTOMÁTICO de {branch} en {repo_dir}")
                     
-                    # Checkout original branch
-                    subprocess.run(
-                        ["git", "checkout", "-"],
+                    # Intentar volver a main o master (ya que checkout - puede fallar si Cerebro no hizo checkout antes)
+                    checkout_res = subprocess.run(
+                        ["git", "checkout", "main"],
                         cwd=repo_dir, capture_output=True, text=True
                     )
+                    if checkout_res.returncode != 0:
+                        subprocess.run(
+                            ["git", "checkout", "master"],
+                            cwd=repo_dir, capture_output=True, text=True
+                        )
                     
                     # Merge from new branch
                     res = subprocess.run(
@@ -91,7 +105,7 @@ class EventRouter:
                         # Si es interactivo (feature/bugfix), enviar al Tribunal de Agentes en paralelo
                         if not event.type.startswith("autofix"):
                             import asyncio
-                            asyncio.create_task(self._trigger_tribunal(repo_dir, target))
+                            asyncio.create_task(self._trigger_tribunal(repo_dir, target, target_abs))
 
                     else:
                         logger.warning(f"⚠️ Fallo al hacer merge automático: {res.stderr}")
@@ -108,7 +122,7 @@ class EventRouter:
                 
             return result
 
-    async def _trigger_tribunal(self, repo_dir: str, target: str):
+    async def _trigger_tribunal(self, repo_dir: str, target: str, target_abs: str):
         """Dispara de manera encadenada a Sentinel, Architect y Warden tras la implementación de un requerimiento manual."""
         from app.dispatcher import send_raw_command
         from app.sockets import emit_agent_event
@@ -126,7 +140,7 @@ class EventRouter:
             logger.info("⚖️ -> Ejecutando Sentinel...")
             await send_raw_command("sentinel", {
                 "action": "pro", "subcommand": "check",
-                "target": repo_dir,
+                "target": target_abs or repo_dir,
                 "request_id": f"sentinel-{uuid.uuid4().hex[:8]}"
             })
             await asyncio.sleep(6)  # Darle margen a Sentinel
@@ -135,7 +149,7 @@ class EventRouter:
             logger.info("⚖️ -> Ejecutando Architect...")
             await send_raw_command("architect", {
                 "action": "pro", "subcommand": "review",
-                "target": repo_dir,
+                "target": target_abs or repo_dir,
                 "request_id": f"architect-{uuid.uuid4().hex[:8]}"
             })
             await asyncio.sleep(6)
@@ -144,7 +158,7 @@ class EventRouter:
             logger.info("⚖️ -> Ejecutando Warden...")
             await send_raw_command("warden", {
                 "action": "pro", "subcommand": "scan",
-                "target": repo_dir,
+                "target": target_abs or repo_dir,
                 "request_id": f"warden-{uuid.uuid4().hex[:8]}"
             })
             

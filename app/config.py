@@ -2,18 +2,14 @@ from pydantic_settings import BaseSettings
 from functools import lru_cache
 from pathlib import Path
 import platform
+import os
 
-# Detectar ruta base según sistema operativo
-_system = platform.system()
-if _system == "Windows":
-    # Windows: usar el directorio del usuario o una ruta configurable
-    _default_workspace = str(Path.home() / "Documents" / "dev")
-elif _system == "Darwin":
-    # macOS
-    _default_workspace = str(Path.home() / "dev")
-else:
-    # Linux (mantener compatibilidad)
-    _default_workspace = "/home/protec/Documentos/dev"
+# Detectar ruta base dinámicamente según la ubicación de este archivo
+# __file__ -> cerebro/app/config.py
+# 1er dirname -> cerebro/app
+# 2do dirname -> cerebro
+# 3er dirname -> skrymir-suite (workspace root)
+_default_workspace = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class Settings(BaseSettings):
