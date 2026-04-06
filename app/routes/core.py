@@ -10,13 +10,19 @@ Rutas:
   POST /select-project
   POST /command/{agent}   (proxy transparente)
   POST /interaction-response
+  GET  /browse-directory
+  POST /set-workspace-root
+  GET  /current-workspace
 """
 
 import logging
+import os
+from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 from app.models import AgentEvent, ApiResponse, OrchestratorCommand
 from app.orchestrator import orchestrator
 from app.dispatcher import send_command, send_raw_command
+from app.config import get_settings
 
 router = APIRouter(tags=["core"])
 logger = logging.getLogger("cerebro.routes.core")
@@ -29,10 +35,14 @@ async def health():
 
 @router.get("/status", response_model=ApiResponse, summary="Estado actual del Orquestador")
 async def get_status():
-    return ApiResponse(ok=True, message="Estado obtenido", data={
-        "active_project":  orchestrator.active_project,
-        "workspace_root":  orchestrator.workspace_root,
-    })
+    try:
+        return ApiResponse(ok=True, message="Estado obtenido", data={
+            "active_project": orchestrator.active_project,
+            "workspace_root": orchestrator.workspace_root,
+        })
+    except Exception as e:
+        logger.exception("Error getting status")
+        return ApiResponse(ok=False, message=f"Error: {str(e)}", data={})
 
 
 @router.post("/events", response_model=ApiResponse, summary="Recibir evento de un agente")
@@ -55,22 +65,42 @@ async def bootstrap():
 
 @router.get("/projects", response_model=ApiResponse, summary="Listar proyectos disponibles")
 async def get_projects():
-    import os
-    projects = [
-        d for d in os.listdir(orchestrator.workspace_root)
-        if os.path.isdir(os.path.join(orchestrator.workspace_root, d)) and not d.startswith(".")
-    ]
-    return ApiResponse(ok=True, message="Proyectos obtenidos", data={"projects": sorted(projects)})
+    try:
+        import os
+        workspace = orchestrator.workspace_root
+        logger.info(f"[Projects] Scanning workspace: {workspace}")
+
+        if not os.path.exists(workspace):
+            logger.warning(f"[Projects] Workspace does not exist: {workspace}")
+            return ApiResponse(ok=True, message="Workspace not found", data={"projects": []})
+
+        projects = [
+            d for d in os.listdir(workspace)
+            if os.path.isdir(os.path.join(workspace, d)) and not d.startswith(".")
+        ]
+        logger.info(f"[Projects] Found {len(projects)} projects")
+        return ApiResponse(ok=True, message="Proyectos obtenidos", data={"projects": sorted(projects)})
+    except Exception as e:
+        logger.exception(f"[Projects] Error scanning projects: {e}")
+        return ApiResponse(ok=False, message=f"Error: {str(e)}", data={"projects": []})
 
 
 @router.post("/select-project", response_model=ApiResponse, summary="Establecer proyecto activo")
 async def select_project(request: Request):
-    body = await request.json()
-    project_name = body.get("project")
-    if not project_name:
-        raise HTTPException(status_code=400, detail="project_name requerido")
-    result = await orchestrator.set_active_project(project_name)
-    return ApiResponse(ok=True, message="Proyecto seleccionado", data=result)
+    try:
+        body = await request.json()
+        project_name = body.get("project")
+        if not project_name:
+            raise HTTPException(status_code=400, detail="project_name requerido")
+        logger.info(f"[SelectProject] Selecting project: {project_name}")
+        result = await orchestrator.set_active_project(project_name)
+        logger.info(f"[SelectProject] Result: {result}")
+        return ApiResponse(ok=True, message="Proyecto seleccionado", data=result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"[SelectProject] Error: {e}")
+        return ApiResponse(ok=False, message=f"Error: {str(e)}", data={})
 
 
 @router.post("/command/{agent}", response_model=ApiResponse, summary="Enviar comando a un agente")
@@ -183,3 +213,360 @@ async def get_logs(lines: int = 50):
         return ApiResponse(ok=False, message="No se pudo acceder a los logs", data={"logs": []})
     except Exception as e:
         return ApiResponse(ok=False, message=f"Error leyendo logs: {str(e)}", data={"logs": []})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NAVEGACIÓN DE DIRECTORIOS
+# ═══════════════���═══════════════════════════════════════════════════════════════
+
+@router.get("/browse-directory", response_model=ApiResponse, summary="Navegar directorios del sistema")
+async def browse_directory(path: str = None):
+    """
+    Lista directorios disponibles en una ruta dada.
+    Si no se especifica path, usa el workspace_root actual.
+    """
+    try:
+        settings = get_settings()
+        base_path = path or settings.workspace_root
+
+        # Normalizar la ruta
+        base_path = os.path.expanduser(base_path)
+        base_path = os.path.abspath(base_path)
+
+        # Verificar que el directorio existe
+        if not os.path.exists(base_path):
+            return ApiResponse(ok=False, message=f"Ruta no existe: {base_path}", data=None)
+
+        if not os.path.isdir(base_path):
+            return ApiResponse(ok=False, message=f"No es un directorio: {base_path}", data=None)
+
+        # Listar directorios
+        items = []
+        for item in sorted(os.listdir(base_path)):
+            item_path = os.path.join(base_path, item)
+            # Solo incluir directorios que no empiecen con .
+            if os.path.isdir(item_path) and not item.startswith("."):
+                # Detectar si parece un proyecto (tiene archivos típicos)
+                is_project = _is_likely_project(item_path)
+                items.append({
+                    "name": item,
+                    "path": item_path.replace("\\", "/"),
+                    "is_project": is_project
+                })
+
+        # Obtener directorio padre
+        parent = os.path.dirname(base_path)
+        # En Windows, no subir más allé de las unidades
+        if os.name == 'nt' and len(parent) <= 3 and parent.endswith(':\\'):
+            parent = None
+        elif base_path == parent or base_path == "/":
+            parent = None
+
+        return ApiResponse(ok=True, message="Directorios listados", data={
+            "current_path": base_path.replace("\\", "/"),
+            "parent_path": parent.replace("\\", "/") if parent else None,
+            "directories": items,
+            "is_workspace_root": base_path == settings.workspace_root
+        })
+
+    except PermissionError:
+        return ApiResponse(ok=False, message="Sin permisos para acceder a esta ruta", data=None)
+    except Exception as e:
+        logger.exception("Error navegando directorios")
+        return ApiResponse(ok=False, message=f"Error: {str(e)}", data=None)
+
+
+def _is_likely_project(path: str) -> bool:
+    """Detecta si un directorio parece ser un proyecto basado en archivos típicos."""
+    project_indicators = [
+        # Git
+        ".git",
+        # JavaScript/Node
+        "package.json", "node_modules",
+        # Python
+        "requirements.txt", "pyproject.toml", "setup.py", "Pipfile",
+        # Rust
+        "Cargo.toml",
+        # Go
+        "go.mod",
+        # Java/Maven/Gradle
+        "pom.xml", "build.gradle",
+        # .NET
+        "*.csproj", "*.sln",
+        # Ruby
+        "Gemfile",
+        # PHP
+        "composer.json",
+        # Docker
+        "Dockerfile", "docker-compose.yml",
+        # Configuración general
+        ".vscode", ".idea", ".github"
+    ]
+
+    try:
+        for item in os.listdir(path):
+            # Verificar coincidencia exacta o patrón
+            if item in project_indicators:
+                return True
+            # Verificar archivos con extensión
+            for indicator in project_indicators:
+                if indicator.startswith("*") and item.endswith(indicator[1:]):
+                    return True
+        return False
+    except:
+        return False
+
+
+@router.get("/current-workspace", response_model=ApiResponse, summary="Obtener workspace actual")
+async def get_current_workspace():
+    """Devuelve el workspace_root actualmente configurado."""
+    settings = get_settings()
+    return ApiResponse(ok=True, message="Workspace actual", data={
+        "workspace_root": settings.workspace_root.replace("\\", "/"),
+        "workspace_name": os.path.basename(settings.workspace_root)
+    })
+
+
+@router.post("/set-workspace-root", response_model=ApiResponse, summary="Cambiar workspace root")
+async def set_workspace_root(request: Request):
+    """
+    Cambia el workspace_root dinámicamente.
+    Esto actualiza la configuración en tiempo de ejecución.
+    """
+    try:
+        body = await request.json()
+        new_workspace = body.get("workspace_root")
+        project_name = body.get("project_name")  # Opcional: nombre del proyecto a seleccionar
+
+        if not new_workspace:
+            raise HTTPException(status_code=400, detail="workspace_root es requerido")
+
+        # Normalizar la ruta
+        new_workspace = os.path.expanduser(new_workspace)
+        new_workspace = os.path.abspath(new_workspace)
+
+        # Verificar que existe
+        if not os.path.exists(new_workspace):
+            return ApiResponse(ok=False, message=f"La ruta no existe: {new_workspace}", data=None)
+
+        if not os.path.isdir(new_workspace):
+            return ApiResponse(ok=False, message=f"No es un directorio: {new_workspace}", data=None)
+
+        # Actualizar configuración
+        settings = get_settings()
+        # Nota: En Pydantic v2, necesitamos modificar el objeto directamente
+        object.__setattr__(settings, 'workspace_root', new_workspace)
+
+        # Actualizar el project_manager del orchestrator
+        orchestrator._projects.workspace_root = new_workspace
+
+        logger.info(f"Workspace root cambiado a: {new_workspace}")
+
+        # Si se proporcionó un nombre de proyecto, seleccionarlo
+        if project_name:
+            result = await orchestrator.set_active_project(project_name)
+            return ApiResponse(ok=True, message="Workspace y proyecto actualizados", data={
+                "workspace_root": new_workspace.replace("\\", "/"),
+                "project": result
+            })
+
+        return ApiResponse(ok=True, message="Workspace root actualizado", data={
+            "workspace_root": new_workspace.replace("\\", "/")
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error cambiando workspace root")
+        return ApiResponse(ok=False, message=f"Error: {str(e)}", data=None)
+
+
+@router.post("/select-custom-project", response_model=ApiResponse, summary="Seleccionar proyecto desde ruta arbitraria")
+async def select_custom_project(request: Request):
+    """
+    Selecciona un proyecto desde cualquier ruta del sistema de archivos.
+    El proyecto se registra con el nombre del directorio.
+    El inicio de agentes se hace en segundo plano para responder rápido.
+    """
+    import asyncio
+    from app.sockets import emit_agent_event
+
+    try:
+        body = await request.json()
+        project_path = body.get("project_path")
+
+        if not project_path:
+            raise HTTPException(status_code=400, detail="project_path es requerido")
+
+        # Normalizar la ruta
+        project_path = os.path.expanduser(project_path)
+        project_path = os.path.abspath(project_path)
+
+        # Verificar que existe
+        if not os.path.exists(project_path):
+            return ApiResponse(ok=False, message=f"La ruta no existe: {project_path}", data=None)
+
+        if not os.path.isdir(project_path):
+            return ApiResponse(ok=False, message=f"No es un directorio: {project_path}", data=None)
+
+        # Obtener el nombre del proyecto (último componente de la ruta)
+        project_name = os.path.basename(project_path)
+
+        # Actualizar workspace_root al directorio padre
+        parent_dir = os.path.dirname(project_path)
+        settings = get_settings()
+        object.__setattr__(settings, 'workspace_root', parent_dir)
+        orchestrator._projects.workspace_root = parent_dir
+
+        # Establecer el proyecto activo (solo el nombre, sin iniciar agentes aún)
+        # Usamos set_active en lugar de set_active_project para evitar iniciar sentinel inmediatamente
+        orchestrator._projects._active_project = project_name
+        orchestrator._projects._monitored_project = None  # Reset monitoring
+
+        logger.info(f"Proyecto personalizado seleccionado: {project_name} en {parent_dir}")
+
+        # Iniciar agentes en segundo plano (no bloquea la respuesta)
+        async def background_init():
+            try:
+                await asyncio.sleep(0.5)  # Pequeño delay para que la respuesta HTTP se envíe primero
+
+                # Obtener configuración de auto-start con prioridad
+                from app.config_manager import UnifiedConfigManager
+                manager = UnifiedConfigManager.get_instance()
+                unified_config = manager.get_config()
+                cerebro_config = unified_config.cerebro if hasattr(unified_config, 'cerebro') else None
+                auto_start_agents = cerebro_config.auto_start_agents if cerebro_config else ["sentinel"]
+
+                logger.info(f"Iniciando agentes en orden de prioridad: {auto_start_agents}")
+
+                # Iniciar cada agente en el orden especificado
+                for agent_name in auto_start_agents:
+                    try:
+                        # Verificar el modo del agente desde cerebro config
+                        agent_mode = cerebro_config.agent_modes.get(agent_name, "core") if cerebro_config else "core"
+                        core_service_name = agent_name  # e.g., "architect"
+                        adk_service_name = f"{agent_name}_adk"  # e.g., "architect_adk"
+                        is_adk_mode = agent_mode == "adk"
+
+                        logger.info(f"Iniciando {agent_name} en modo {agent_mode} (prioridad: {auto_start_agents.index(agent_name) + 1})")
+
+                        if is_adk_mode:
+                            # ADK mode: iniciar Core primero, luego ADK
+                            # Step 1a: Iniciar Core Engine
+                            try:
+                                import httpx
+                                async with httpx.AsyncClient(timeout=10.0) as client:
+                                    start_resp = await client.post(
+                                        f"{settings.executor_url}/command",
+                                        json={
+                                            "action": "open",
+                                            "service": core_service_name,
+                                            "request_id": f"cerebro-custom-{core_service_name}"
+                                        }
+                                    )
+                                    if start_resp.status_code == 200:
+                                        logger.info(f"✅ Ejecutor inició {core_service_name} (Core para ADK)")
+                                    else:
+                                        logger.warning(f"⚠️ Ejecutor returned {start_resp.status_code} for {core_service_name}")
+                            except Exception as e:
+                                logger.warning(f"⚠️ No se pudo iniciar {core_service_name} via Ejecutor: {e}")
+
+                            await asyncio.sleep(3)  # Esperar a que Core inicie
+
+                            # Step 1b: Iniciar ADK
+                            try:
+                                async with httpx.AsyncClient(timeout=10.0) as client:
+                                    start_resp = await client.post(
+                                        f"{settings.executor_url}/command",
+                                        json={
+                                            "action": "open",
+                                            "service": adk_service_name,
+                                            "request_id": f"cerebro-custom-{adk_service_name}"
+                                        }
+                                    )
+                                    if start_resp.status_code == 200:
+                                        logger.info(f"✅ Ejecutor inició {adk_service_name} (ADK)")
+                                    else:
+                                        logger.warning(f"⚠️ Ejecutor returned {start_resp.status_code} for {adk_service_name}")
+                            except Exception as e:
+                                logger.warning(f"⚠️ No se pudo iniciar {adk_service_name} via Ejecutor: {e}")
+
+                            await asyncio.sleep(2)  # Esperar a que ADK inicie
+
+                            # Step 2: Enviar comando al ADK
+                            from app.dispatcher import send_command
+                            from app.models import OrchestratorCommand
+
+                            ack = await send_command(
+                                adk_service_name,
+                                OrchestratorCommand(action="open", service=adk_service_name)
+                            )
+
+                            if ack.get("status") == "ok":
+                                logger.info(f"✅ {adk_service_name} respondió correctamente")
+                            else:
+                                logger.warning(f"⚠️ {adk_service_name} no respondió: {ack.get('error')}")
+
+                        else:
+                            # Core mode only
+                            try:
+                                import httpx
+                                async with httpx.AsyncClient(timeout=10.0) as client:
+                                    start_resp = await client.post(
+                                        f"{settings.executor_url}/command",
+                                        json={
+                                            "action": "open",
+                                            "service": core_service_name,
+                                            "request_id": f"cerebro-custom-{core_service_name}"
+                                        }
+                                    )
+                                    if start_resp.status_code == 200:
+                                        logger.info(f"✅ Ejecutor inició {core_service_name}")
+                                    else:
+                                        logger.warning(f"⚠️ Ejecutor returned {start_resp.status_code} for {core_service_name}")
+                            except Exception as e:
+                                logger.warning(f"⚠️ No se pudo iniciar {core_service_name} via Ejecutor: {e}")
+
+                            await asyncio.sleep(2)
+
+                            # Enviar comando al Core
+                            from app.dispatcher import send_command
+                            from app.models import OrchestratorCommand
+
+                            ack = await send_command(
+                                core_service_name,
+                                OrchestratorCommand(action="open", service=core_service_name)
+                            )
+
+                            if ack.get("status") == "ok":
+                                logger.info(f"✅ {core_service_name} respondió correctamente")
+                            else:
+                                logger.warning(f"⚠️ {core_service_name} no respondió: {ack.get('error')}")
+
+                        # Pequeña pausa entre agentes para no saturar
+                        await asyncio.sleep(1)
+
+                    except Exception as agent_error:
+                        logger.error(f"❌ Error iniciando {agent_name}: {agent_error}")
+                        continue  # Continuar con el siguiente agente
+
+                # Finalmente activar el proyecto
+                result = await orchestrator._projects.set_active(project_name)
+                logger.info(f"Background init completado para {project_name}: {result}")
+
+            except Exception as e:
+                logger.exception(f"Error en background init: {e}")
+
+        asyncio.create_task(background_init())
+
+        return ApiResponse(ok=True, message="Proyecto seleccionado - Iniciando agentes en segundo plano", data={
+            "project_name": project_name,
+            "project_path": project_path.replace("\\", "/"),
+            "workspace_root": parent_dir.replace("\\", "/")
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error seleccionando proyecto personalizado")
+        return ApiResponse(ok=False, message=f"Error: {str(e)}", data=None)

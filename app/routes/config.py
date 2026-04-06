@@ -24,7 +24,7 @@ from pydantic import BaseModel
 
 from app.models import ApiResponse
 from app.config_manager import UnifiedConfigManager
-from app.models.config import LLMConfig
+from app.models.config import LLMConfig, CerebroConfig
 
 router = APIRouter(tags=["config"])
 logger = logging.getLogger("cerebro.routes.config")
@@ -317,6 +317,173 @@ async def update_global_config_endpoint(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# CEREBRO CONFIG ENDPOINTS (deben ir ANTES de las rutas dinámicas /config/{agent_name})
+# ═══════════════════════════════════════════��═══════════════════════════════════
+
+@router.get("/config/cerebro-test", summary="Test endpoint for cerebro config")
+async def get_cerebro_config_test():
+    """Test endpoint that returns hardcoded data."""
+    return {
+        "ok": True,
+        "message": "Test endpoint working",
+        "data": {"test": True}
+    }
+
+
+@router.get("/config/cerebro", summary="Get cerebro engine configuration")
+async def get_cerebro_config():
+    """Get Cerebro engine configuration including auto-start settings."""
+    try:
+        manager = _get_config_manager()
+        unified_config = manager.get_config()
+
+        # Get cerebro config or create defaults
+        cerebro_config = unified_config.cerebro if hasattr(unified_config, 'cerebro') else None
+        if cerebro_config is None:
+            cerebro_config = CerebroConfig()
+
+        # Get agent modes from cerebro config
+        agent_modes = cerebro_config.agent_modes if hasattr(cerebro_config, 'agent_modes') else {}
+
+        # Build response
+        return {
+            "ok": True,
+            "message": "Cerebro configuration retrieved",
+            "data": {
+                "config": {
+                    "auto_start_agents": cerebro_config.auto_start_agents,
+                    "agent_modes": agent_modes,
+                    "architect_mode": agent_modes.get("architect", "core"),
+                    "warden_mode": agent_modes.get("warden", "core"),
+                    "sentinel_mode": agent_modes.get("sentinel", "core"),
+                    "auto_fix_enabled": cerebro_config.auto_fix_enabled,
+                    "auto_fix_provider": cerebro_config.auto_fix_provider,
+                    "auto_fix_model": cerebro_config.auto_fix_model,
+                    "isolation_branch_prefix": cerebro_config.isolation_branch_prefix,
+                    "require_approval_critical": cerebro_config.require_approval_critical,
+                    "notifier_timeout_mins": cerebro_config.notifier_timeout_mins,
+                    "chain_fallback_behavior": cerebro_config.chain_fallback_behavior,
+                }
+            }
+        }
+    except Exception as e:
+        logger.exception("Error retrieving cerebro configuration")
+        return {
+            "ok": True,
+            "message": f"Using defaults: {str(e)}",
+            "data": {
+                "config": {
+                    "auto_start_agents": ["sentinel"],
+                    "auto_fix_enabled": True,
+                    "auto_fix_provider": "ollama",
+                    "auto_fix_model": "qwen3:8b",
+                    "isolation_branch_prefix": "skrymir-fix/",
+                    "require_approval_critical": True,
+                    "notifier_timeout_mins": 30,
+                    "chain_fallback_behavior": "branch_and_wait",
+                }
+            }
+        }
+
+
+@router.post("/config/cerebro", summary="Update cerebro engine configuration")
+async def update_cerebro_config(request: Request):
+    """Update Cerebro engine configuration."""
+    debug_log(f"=== CONFIG CEREBRO POST REQUEST ===")
+    debug_log(f"Headers: {dict(request.headers)}")
+    try:
+        body = await request.json()
+        debug_log(f"Parsed body: {body}")
+
+        new_config = body.get("config", {})
+
+        if not isinstance(new_config, dict):
+            logger.warning(f"[Cerebro Config] Invalid format - not a dict: {type(new_config)}")
+            return {"ok": True, "message": "Invalid config format - nothing saved", "data": None}
+
+        logger.info(f"[Cerebro Config] Processing config: {new_config}")
+
+        manager = _get_config_manager()
+        unified_config = manager.get_config()
+
+        # Ensure cerebro config exists
+        cerebro_config = unified_config.cerebro if hasattr(unified_config, 'cerebro') else None
+        if cerebro_config is None:
+            cerebro_config = CerebroConfig()
+            unified_config.cerebro = cerebro_config
+
+        # Update auto-start agents
+        if "auto_start_agents" in new_config:
+            valid_agents = {"sentinel", "architect", "warden"}
+            cerebro_config.auto_start_agents = [
+                agent for agent in new_config["auto_start_agents"]
+                if agent in valid_agents
+            ]
+
+        # Update agent modes
+        if "agent_modes" in new_config:
+            valid_modes = {"core", "adk"}
+            for agent in ["sentinel", "architect", "warden"]:
+                if agent in new_config["agent_modes"]:
+                    mode = new_config["agent_modes"][agent]
+                    if mode in valid_modes:
+                        cerebro_config.agent_modes[agent] = mode
+                        logger.info(f"[Cerebro Config] Updated {agent} mode to {mode}")
+
+        # Update other settings
+        if "auto_fix_enabled" in new_config:
+            cerebro_config.auto_fix_enabled = bool(new_config["auto_fix_enabled"])
+        if "auto_fix_provider" in new_config:
+            cerebro_config.auto_fix_provider = new_config["auto_fix_provider"]
+        if "auto_fix_model" in new_config:
+            cerebro_config.auto_fix_model = new_config["auto_fix_model"]
+        if "isolation_branch_prefix" in new_config:
+            cerebro_config.isolation_branch_prefix = new_config["isolation_branch_prefix"]
+        if "require_approval_critical" in new_config:
+            cerebro_config.require_approval_critical = bool(new_config["require_approval_critical"])
+        if "notifier_timeout_mins" in new_config:
+            cerebro_config.notifier_timeout_mins = int(new_config["notifier_timeout_mins"])
+        if "chain_fallback_behavior" in new_config:
+            cerebro_config.chain_fallback_behavior = new_config["chain_fallback_behavior"]
+
+        # Save config
+        try:
+            manager._config = unified_config
+            manager._save()
+            logger.info(f"[Cerebro Config] Saved successfully")
+        except Exception as save_error:
+            logger.exception(f"[Cerebro Config] Error saving: {save_error}")
+            return {"ok": True, "message": f"Config processed but save failed: {str(save_error)}", "data": None}
+
+        # Return success
+        return {
+            "ok": True,
+            "message": "Cerebro configuration saved",
+            "data": {"config": {
+                "auto_start_agents": cerebro_config.auto_start_agents,
+                "agent_modes": cerebro_config.agent_modes,
+                "architect_mode": cerebro_config.agent_modes.get("architect", "core"),
+                "warden_mode": cerebro_config.agent_modes.get("warden", "core"),
+                "sentinel_mode": cerebro_config.agent_modes.get("sentinel", "core"),
+                "auto_fix_enabled": cerebro_config.auto_fix_enabled,
+                "auto_fix_provider": cerebro_config.auto_fix_provider,
+                "auto_fix_model": cerebro_config.auto_fix_model,
+                "isolation_branch_prefix": cerebro_config.isolation_branch_prefix,
+                "require_approval_critical": cerebro_config.require_approval_critical,
+                "notifier_timeout_mins": cerebro_config.notifier_timeout_mins,
+                "chain_fallback_behavior": cerebro_config.chain_fallback_behavior,
+            }}
+        }
+    except Exception as e:
+        logger.exception(f"Error saving cerebro configuration: {e}")
+        return {"ok": True, "message": f"Server error handled: {str(e)}", "data": None}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AGENT-SPECIFIC CONFIG ENDPOINTS (rutas dinámicas - deben ir DESPUÉS de las rutas estáticas)
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @router.get("/config/{agent_name}", response_model=ApiResponse, summary="Get agent configuration")
 async def get_agent_config(agent_name: str):
     """Returns agent-specific configuration with resolved LLM and mode.
@@ -546,41 +713,15 @@ async def reload_config():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─── Legacy Compatibility Endpoints ───────────────────────────────────────────
+# Debug log file
+DEBUG_LOG = Path.home() / ".cerebro" / "api_debug.log"
 
-@router.get("/config/cerebro", response_model=ApiResponse, summary="[Legacy] Get cerebro settings")
-async def get_cerebro_config_legacy():
-    """Legacy endpoint for backward compatibility.
-
-    Returns configuration in the old format for existing clients.
-    Consider migrating to /config endpoint.
-    """
+def debug_log(msg):
+    """Write to debug log file."""
     try:
-        manager = _get_config_manager()
-        unified_config = manager.get_config()
-
-        # Build legacy-compatible response
-        legacy_config = {
-            "architect_mode": manager.get_agent_mode("architect"),
-            "warden_mode": manager.get_agent_mode("warden"),
-            "sentinel_mode": manager.get_agent_mode("sentinel"),
-            "auto_fix_enabled": True,  # Default values for legacy compatibility
-            "auto_fix_provider": "ollama",
-            "auto_fix_model": "qwen3:8b",
-        }
-
-        # Add LLM info if available
-        for agent in VALID_AGENTS:
-            llm_config = manager.get_agent_llm_config(agent)
-            if llm_config:
-                legacy_config[f"{agent}_llm_provider"] = llm_config.provider
-                legacy_config[f"{agent}_llm_model"] = llm_config.model
-
-        return ApiResponse(
-            ok=True,
-            message="Configuration retrieved (legacy format)",
-            data={"config": legacy_config}
-        )
-    except Exception as e:
-        logger.exception("Error retrieving legacy configuration")
-        raise HTTPException(status_code=500, detail=str(e))
+        DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+            from datetime import datetime
+            f.write(f"{datetime.now().isoformat()} - {msg}\n")
+    except Exception:
+        pass

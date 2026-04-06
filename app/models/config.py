@@ -193,6 +193,58 @@ class ProjectOverride(BaseModel):
     )
 
 
+class CerebroConfig(BaseModel):
+    """Configuration for the Cerebro orchestrator engine."""
+
+    auto_start_agents: List[str] = Field(
+        default_factory=lambda: ["sentinel"],
+        description="List of agent names to auto-start when Cerebro initializes"
+    )
+    auto_fix_enabled: bool = Field(
+        default=True,
+        description="Allow auto-delegation to Executor for code fixes"
+    )
+    auto_fix_provider: str = Field(
+        default="ollama",
+        description="LLM provider for auto-fix operations"
+    )
+    auto_fix_model: str = Field(
+        default="qwen3:8b",
+        description="Model name for auto-fix operations"
+    )
+    isolation_branch_prefix: str = Field(
+        default="skrymir-fix/",
+        description="Prefix for git isolation branches"
+    )
+    require_approval_critical: bool = Field(
+        default=True,
+        description="Require human approval for critical changes"
+    )
+    notifier_timeout_mins: int = Field(
+        default=30,
+        description="Timeout for notifier approval requests"
+    )
+    chain_fallback_behavior: str = Field(
+        default="branch_and_wait",
+        description="Fallback behavior when no human response"
+    )
+    agent_modes: Dict[str, Literal["core", "adk"]] = Field(
+        default_factory=lambda: {
+            "sentinel": "core",
+            "architect": "core",
+            "warden": "core"
+        },
+        description="Mode configuration for each agent (core or adk)"
+    )
+
+    @field_validator("auto_start_agents")
+    @classmethod
+    def validate_auto_start_agents(cls, v: List[str]) -> List[str]:
+        """Validate that auto-start agents are valid."""
+        valid_agents = {"sentinel", "architect", "warden"}
+        return [agent for agent in v if agent in valid_agents]
+
+
 class UnifiedConfig(BaseModel):
     """Root configuration model for the entire Skrymir system.
 
@@ -204,6 +256,11 @@ class UnifiedConfig(BaseModel):
         default="1.0.0",
         pattern=r"^\d+\.\d+\.\d+$",
         description="Configuration schema version"
+    )
+
+    cerebro: CerebroConfig = Field(
+        default_factory=CerebroConfig,
+        description="Cerebro orchestrator engine configuration"
     )
 
     global_config: Dict[str, Any] = Field(

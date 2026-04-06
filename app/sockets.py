@@ -3,6 +3,8 @@ import logging
 import uuid
 from datetime import datetime
 
+from app.schemas.events import validate_event, create_event, EventType, EventValidationError
+
 logger = logging.getLogger("cerebro.sockets")
 
 # Crear servidor Socket.IO asíncrono
@@ -52,38 +54,36 @@ async def disconnect(sid):
 async def emit_agent_event(event_data: dict):
     """
     Emite un evento de agente a todos los clientes conectados.
+    Valida contra schema antes de emitir.
     Agrega timestamp e ID único para que el dashboard los renderice.
     Guarda eventos de interacción pendientes para clientes futuros.
     También guarda el estado de readiness de los agentes.
     """
     try:
-        # Agregar timestamp e ID único para cada evento
-        event_with_metadata = {
-            **event_data,
-            'id': str(uuid.uuid4()),
-            'timestamp': datetime.utcnow().isoformat() + 'Z'
-        }
+        # Validate event against schema
+        validated = validate_event(event_data)
+        event_with_metadata = validated.model_dump()
 
-        # Guardar estado de readiness de los agentes (antes de modificar event_data)
-        if event_data.get('type') in ['sentinel_ready', 'architect_ready', 'warden_ready']:
+        # Guardar estado de readiness de los agentes
+        if event_data.get('type') in ['sentinel_ready', 'architect_ready', 'warden_ready',
+                                       'sentinel_adk_ready', 'architect_adk_ready', 'warden_adk_ready']:
             agent = event_data.get('source')
             if agent and agent in agent_ready_state:
                 agent_ready_state[agent] = True
                 logger.info(f"💾 Estado {agent}_ready guardado")
 
         # Guardar eventos de interacción para clientes que se conecten después
-        # Y emitir inmediatamente a clientes conectados
         if event_data.get('type') == 'interaction_required':
             pending_interaction_events.append(event_with_metadata)
             logger.info(f"💾 Evento de interacción guardado (pendientes: {len(pending_interaction_events)})")
-            # Emitir el evento CON metadata (id, timestamp)
-            await sio.emit('agent_event', event_with_metadata)
-            logger.info(f"📤 interaction_required emitido: step={event_with_metadata.get('payload', {}).get('wizard_step')}, prompt_id={event_with_metadata.get('payload', {}).get('prompt_id')}")
-        else:
-            # Para eventos normales, usamos metadata y emitimos
-            event_data = event_with_metadata
-            await sio.emit('agent_event', event_data)
-            logger.debug(f"📤 Evento emitido por Socket.IO: {event_data.get('type')}")
+
+        await sio.emit('agent_event', event_with_metadata)
+        logger.debug(f"📤 Evento emitido por Socket.IO: {event_data.get('type')}")
+
+    except EventValidationError as e:
+        logger.warning(f"⚠️ Evento con schema inválido: {e}")
+        # Still emit but log the issue
+        await sio.emit('agent_event', event_data)
     except Exception as e:
         logger.error(f"❌ Error emitiendo por Socket.IO: {e}")
 
@@ -95,3 +95,19 @@ async def emit_system_status(status_data: dict):
         await sio.emit('system_status', status_data)
     except Exception as e:
         logger.error(f"❌ Error emitiendo status por Socket.IO: {e}")
+
+async def emit_pipeline_event(event_type: str, payload: dict):
+    """Emit pipeline event to dashboard with schema validation."""
+    try:
+        from app.schemas.events import EventType
+
+        event_type_enum = EventType(f"pipeline_{event_type}")
+        event_data = create_event(
+            source='cerebro',
+            event_type=event_type_enum,
+            payload=payload
+        )
+        await sio.emit('agent_event', event_data)
+        logger.debug(f"📤 Pipeline event emitted: {event_type}")
+    except Exception as e:
+        logger.error(f"❌ Error emitting pipeline event: {e}")

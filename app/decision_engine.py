@@ -28,6 +28,7 @@ class DecisionAction(Enum):
     BLOCK = "block"
     IGNORE = "ignore"
     ESCALATE = "escalate"
+    AUTOFIX = "autofix"  # NUEVO: Modo Proactivo/Autómata
 
 
 class SeverityLevel(Enum):
@@ -109,6 +110,61 @@ DEFAULT_DECISION_RULES = {
             "base_severity": "warning",
             "description": "Falta test para archivo modificado",
         },
+        # Sentinel events with findings - trigger pipeline analysis
+        "sentinel_check_completed": {
+            "base_severity": "warning",
+            "description": "Sentinel detectó issues de calidad",
+            "extra_actions": [DecisionAction.CHAIN],
+            "chain_to": ["architect"],
+        },
+        "sentinel_analyze_completed": {
+            "base_severity": "warning",
+            "description": "Sentinel análisis completado",
+            "extra_actions": [DecisionAction.CHAIN],
+            "chain_to": ["architect"],
+        },
+        "sentinel_analyze_error": {
+            "base_severity": "error",
+            "description": "Error en análisis de Sentinel",
+            "extra_actions": [DecisionAction.CHAIN],
+            "chain_to": ["architect"],
+        },
+        "sentinel_check_error": {
+            "base_severity": "error",
+            "description": "Error en check de Sentinel",
+            "extra_actions": [DecisionAction.CHAIN],
+            "chain_to": ["architect"],
+        },
+        # Core Rust analysis events (from monitor.rs)
+        "analysis_completed": {
+            "base_severity": "warning",
+            "description": "Análisis IA de Sentinel completado",
+            "extra_actions": [DecisionAction.CHAIN, DecisionAction.NOTIFY],
+            "chain_to": ["architect"],
+        },
+        "analysis_failed": {
+            "base_severity": "error",
+            "description": "Falló análisis IA de Sentinel",
+            "extra_actions": [DecisionAction.NOTIFY],
+        },
+        "sentinel_audit_completed": {
+            "base_severity": "error",
+            "description": "Sentinel audit completado con hallazgos",
+            "extra_actions": [DecisionAction.CHAIN],
+            "chain_to": ["architect", "warden"],
+        },
+        "sentinel_analysis_completed": {
+            "base_severity": "warning",
+            "description": "Análisis de Sentinel completado",
+            "extra_actions": [DecisionAction.CHAIN],
+            "chain_to": ["architect"],
+        },
+        "sentinel_file_change": {
+            "base_severity": "info",
+            "description": "Cambio de archivo detectado por Sentinel",
+            "extra_actions": [DecisionAction.CHAIN],
+            "chain_to": ["sentinel"],  # Auto-start analysis
+        },
         # Architect ADK events
         "architect_lint_completed": {
             "base_severity": "error",
@@ -145,6 +201,13 @@ DEFAULT_DECISION_RULES = {
     },
     # Agentes disponibles para encadenamiento
     "available_agents": ["sentinel", "architect", "warden"],
+    # Reglas para autofix proactivo
+    "autofix_rules": {
+        "confidence_threshold": 0.8,
+        "night_mode_reduced_threshold": 0.7,
+        "safe_issue_types": ["dead_code", "unused_import", "formatting", "simple_refactor"],
+        "require_validation": True,
+    },
 }
 
 
@@ -278,6 +341,22 @@ class DecisionEngine:
                     decision.reason = "⚠️ (Aprendizaje) Autofix falló repetidamente en este archivo. Bloqueo manual requerido."
                     decision.metadata["suppress_autofix"] = True
                     decision.metadata["failure_history"] = p["last_seen"]
+
+        # 11. Evaluar si corresponde AUTOFIX (Cerebro Proactivo)
+        # Solo para eventos de agentes: no evaluamos autofixes de eventos de Executor o Scheduler
+        agent_sources = {"sentinel", "architect", "warden"}
+        if source in agent_sources and event_type.endswith("_completed"):
+            try:
+                from app.proactive_scheduler import get_proactive_scheduler
+                scheduler = get_proactive_scheduler()
+                night_mode = scheduler.is_night_mode_active()
+                if self.should_autofix(event, night_mode):
+                    if DecisionAction.AUTOFIX not in decision.actions:
+                        decision.actions.append(DecisionAction.AUTOFIX)
+                        decision.reason += "; Autofix automático elegible"
+                        logger.info(f"⚡ AUTOFIX añadido a la decisión (night_mode={night_mode})")
+            except Exception as _ae:
+                logger.debug(f"No se pudo evaluar autofix: {_ae}")
 
         logger.info(f"✅ Decisión: actions={[a.value for a in decision.actions]}, "
                     f"targets={decision.target_agents}, confidence={decision.confidence:.2f}")
@@ -534,3 +613,44 @@ class DecisionEngine:
                     f"actions={[a.value for a in decision.actions]}")
 
         return decision
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # AUTOFIX — Modo Proactivo/Autómata
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def should_autofix(self, event: Dict[str, Any], night_mode_active: bool = False) -> bool:
+        """
+        Determina si un evento merece autofix automático.
+
+        Args:
+            event: Evento del agente con payload estandarizado
+            night_mode_active: True si el sistema está en ventana horaria nocturna
+
+        Returns:
+            True si corresponde disparar un AUTOFIX
+        """
+        autofix_rules = self.rules.get("autofix_rules", {})
+        threshold = autofix_rules.get("confidence_threshold", 0.8)
+        night_threshold = autofix_rules.get("night_mode_reduced_threshold", 0.7)
+        safe_types = autofix_rules.get("safe_issue_types", [])
+
+        payload = event.get("payload", {})
+        confidence = payload.get("confidence", event.get("confidence", 0.0))
+        issue_type = payload.get("issue_type", "")
+
+        # Nunca autofix si está configurado para suprimir (aprendizaje previo)
+        if payload.get("suppress_autofix") or event.get("suppress_autofix"):
+            logger.debug("🚫 Autofix suprimido por aprendizaje previo")
+            return False
+
+        # Modo nocturno: threshold reducido para tipos seguros
+        if night_mode_active and confidence >= night_threshold:
+            logger.debug(f"🌙 Autofix por modo nocturno (confidence={confidence:.2f} >= {night_threshold})")
+            return True
+
+        # Confianza alta + tipo seguro: autofix inmediato
+        if confidence >= threshold and issue_type in safe_types:
+            logger.debug(f"✅ Autofix: confidence={confidence:.2f}, issue_type={issue_type}")
+            return True
+
+        return False

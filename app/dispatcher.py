@@ -33,11 +33,13 @@ def _resolve_sentinel_url() -> str:
 
 
 AGENT_URLS: dict[str, str] = {
-    "sentinel":     _resolve_sentinel_url(),
-    "sentinel_adk": settings.sentinel_adk_url,
-    "architect":    _resolve_architect_url(),
-    "warden":       _resolve_warden_url(),
-    "ejecutor":     settings.executor_url,
+    "sentinel":      _resolve_sentinel_url(),
+    "sentinel_adk":  settings.sentinel_adk_url,
+    "architect":     _resolve_architect_url(),
+    "architect_adk": settings.architect_adk_url,
+    "warden":        _resolve_warden_url(),
+    "warden_adk":    settings.warden_adk_url,
+    "ejecutor":      settings.executor_url,
 }
 
 
