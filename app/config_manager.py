@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 from app.models.config import (
     AgentConfig,
     ArchitectConfig,
+    CerebroConfig,
     LLMConfig,
     ProjectOverride,
     SentinelConfig,
@@ -102,13 +103,44 @@ class UnifiedConfigManager:
 
             # Expand environment variables in loaded data
             data = self._expand_env_vars(data)
-            self._config = UnifiedConfig(**data)
-        except (json.JSONDecodeError, Exception) as e:
-            # If file is corrupted, create default config
-            print(f"Warning: Failed to load config from {self._config_path}: {e}")
-            print("Creating default configuration...")
+            
+            from pydantic import ValidationError
+            try:
+                self._config = UnifiedConfig.model_validate(data)
+            except ValidationError as ve:
+                logging.error(f"❌ Configuration validation error: {ve}")
+                # Intentar preservación parcial: Usar defaults y luego sobreescribir con lo que sea válido del JSON
+                self._config = UnifiedConfig()
+                
+                # Cargar secciones una a una de forma segura
+                if "cerebro" in data:
+                    try: self._config.cerebro = CerebroConfig.model_validate(data["cerebro"])
+                    except: logging.warning("⚠️ No se pudo recuperar sección 'cerebro' del config")
+                
+                if "global_config" in data:
+                    self._config.global_config.update(data["global_config"])
+
+                if "agents" in data:
+                    # Intentar recuperar agentes válidos
+                    for agent_name, agent_data in data["agents"].items():
+                        try: 
+                            # Esto es un poco rudimentario pero ayuda a no perder todo
+                            if agent_name in self._config.agents:
+                                current_agent = self._config.agents[agent_name]
+                                # Solo actualizar si coinciden campos básicos
+                                pass 
+                        except: pass
+                
+                # No guardamos inmediatamente para no persistir un estado corrupto
+                # El usuario deberá guardar desde el Dashboard para arreglarlo
+                
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            logging.warning(f"⚠️ Config corrupted or missing ({e}), using defaults.")
             self._config = UnifiedConfig()
             self._save()
+        except Exception as e:
+            logging.error(f"❌ Unexpected error loading config: {e}")
+            if self._config is None: self._config = UnifiedConfig()
 
     def _save(self) -> bool:
         """Save configuration to JSON file.

@@ -61,6 +61,7 @@ class BaseEvent(BaseModel):
     type: str = Field(..., description="Event type")
     timestamp: Optional[str] = Field(default=None, description="ISO timestamp")
     id: Optional[str] = Field(default=None, description="Unique event ID")
+    payload: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Generic payload")
 
     @field_validator('type')
     @classmethod
@@ -98,11 +99,15 @@ class WizardPayload(BaseModel):
 class AnalysisPayload(BaseModel):
     """Payload for analysis events."""
     target: Optional[str] = None
+    file: Optional[str] = None
     summary: Optional[str] = None
     finding: Optional[str] = None
+    findings: Optional[str] = None
     analysis: Optional[str] = None
     action: Optional[str] = None
     raw_status: Optional[str] = None
+    status: Optional[str] = None
+    message: Optional[str] = None
 
 
 class CommandPayload(BaseModel):

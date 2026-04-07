@@ -138,38 +138,72 @@ class EventRouter:
         try: 
             # 1. Sentinel
             logger.info("⚖️ -> Ejecutando Sentinel...")
-            await send_raw_command("sentinel", {
+            ack_sentinel = await send_raw_command("sentinel", {
                 "action": "pro", "subcommand": "check",
                 "target": target_abs or repo_dir,
                 "request_id": f"sentinel-{uuid.uuid4().hex[:8]}"
             })
+            if ack_sentinel and self.context_db:
+                result_data = ack_sentinel.get("result", {})
+                analysis = result_data.get("analysis") or result_data.get("summary")
+                if analysis:
+                    self.context_db.record_pattern(
+                        pattern_type="sentinel_tribunal_analysis",
+                        description=analysis[:500],
+                        severity="info",
+                        file_path=target,
+                        metadata={"full_analysis": analysis, "source": "sentinel"}
+                    )
             await asyncio.sleep(6)  # Darle margen a Sentinel
 
             # 2. Architect
             logger.info("⚖️ -> Ejecutando Architect...")
-            await send_raw_command("architect", {
+            ack_architect = await send_raw_command("architect", {
                 "action": "pro", "subcommand": "review",
                 "target": target_abs or repo_dir,
                 "request_id": f"architect-{uuid.uuid4().hex[:8]}"
             })
+            if ack_architect and self.context_db:
+                result_data = ack_architect.get("result", {})
+                analysis = result_data.get("analysis") or result_data.get("feedback")
+                if analysis:
+                    self.context_db.record_pattern(
+                        pattern_type="architect_tribunal_review",
+                        description=analysis[:500],
+                        severity="info",
+                        file_path=target,
+                        metadata={"full_analysis": analysis, "source": "architect"}
+                    )
             await asyncio.sleep(6)
 
             # 3. Warden
             logger.info("⚖️ -> Ejecutando Warden...")
-            await send_raw_command("warden", {
+            ack_warden = await send_raw_command("warden", {
                 "action": "pro", "subcommand": "scan",
                 "target": target_abs or repo_dir,
                 "request_id": f"warden-{uuid.uuid4().hex[:8]}"
             })
+            if ack_warden and self.context_db:
+                result_data = ack_warden.get("result", {})
+                finding = result_data.get("finding") or result_data.get("summary")
+                if finding:
+                    self.context_db.record_pattern(
+                        pattern_type="warden_tribunal_scan",
+                        description=finding[:500],
+                        severity="warning",
+                        file_path=target,
+                        metadata={"full_finding": finding, "source": "warden"}
+                    )
             
             await emit_agent_event({
                 "source": "cerebro", "type": "tribunal_completed", "severity": "success",
                 "payload": {"message": f"Tribunal desplegado correctamente sobre {target}"}
             })
-            logger.info(f"✅ TRIBUNAL lanzado exitosamente para {target}")
+            logger.info(f"✅ TRIBUNAL lanzado exitosamente para {target} y guardado en ContextDB")
 
         except Exception as e:
             logger.error(f"❌ Error lanzando el tribunal: {e}")
+
 
     # ── RUTEO HABITUAL ── 
     async def _evaluate_standard(self, event: AgentEvent) -> Dict[str, Any]:

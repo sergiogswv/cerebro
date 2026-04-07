@@ -449,9 +449,17 @@ async def update_cerebro_config(request: Request):
 
         # Save config
         try:
-            manager._config = unified_config
             manager._save()
             logger.info(f"[Cerebro Config] Saved successfully")
+            
+            # Sincronizar archivos legacy para todos los agentes (si hay proyecto activo)
+            try:
+                for agent in VALID_AGENTS:
+                    agent_llm = manager.get_agent_llm_config(agent)
+                    if agent_llm:
+                        _sync_legacy_config_files(agent, agent_llm)
+            except Exception as sync_err:
+                logger.debug(f"[Cerebro Config] Could not sync legacy files: {sync_err}")
         except Exception as save_error:
             logger.exception(f"[Cerebro Config] Error saving: {save_error}")
             return {"ok": True, "message": f"Config processed but save failed: {str(save_error)}", "data": None}

@@ -10,11 +10,13 @@ router = APIRouter()
 class FeatureRequest(BaseModel):
     instruction: str
     target_file: Optional[str] = ""
+    active_project: Optional[str] = ""
     context_files: Optional[List[str]] = []
 
 class BugfixRequest(BaseModel):
     instruction: str
     target_file: str
+    active_project: Optional[str] = ""
     context_files: Optional[List[str]] = []
 
 @router.post("/feature")
@@ -27,6 +29,7 @@ async def request_feature(req: FeatureRequest):
             action="feature",
             target_file=req.target_file,
             instruction=req.instruction,
+            active_project=req.active_project,
             context_files=req.context_files
         )
         return {"ok": True, "message": "Feature request encolado", "data": result}
@@ -44,6 +47,7 @@ async def request_bugfix(req: BugfixRequest):
             action="bugfix",
             target_file=req.target_file,
             instruction=req.instruction,
+            active_project=req.active_project,
             context_files=req.context_files
         )
         return {"ok": True, "message": "Bugfix request encolado", "data": result}

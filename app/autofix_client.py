@@ -66,10 +66,15 @@ class AutofixClient:
 
         autofix_id = str(uuid.uuid4())[:8]
         branch_prefix = "skrymir-fix/"
-
+        
         logger.info(f"🔧 [AutofixClient] Iniciando autofix #{autofix_id} → {target_file}")
 
-        # ── 1. Emitir evento de inicio ──────────────────────────────────────
+        # ── 1. Obtener configuración actual de Cerebro ───────────────────
+        from app.config_manager import UnifiedConfigManager
+        manager = UnifiedConfigManager.get_instance()
+        cerebro_cfg = manager.get_config().cerebro
+        
+        # ── 2. Emitir evento de inicio ──────────────────────────────────────
         await self._emit("autofix_started", {
             "autofix_id": autofix_id,
             "target": target_file,
@@ -78,14 +83,33 @@ class AutofixClient:
             "branch_prefix": branch_prefix,
         })
 
-        # ── 2. Llamar al Executor ───────────────────────────────────────────
+        # ── 3. Llamar al Executor ───────────────────────────────────────────
         try:
+            # Obtener configuración del scheduler para flags de validación
+            from app.proactive_scheduler import get_proactive_scheduler
+            scheduler = get_proactive_scheduler()
+            pro_config = scheduler.get_config(project)
+            val_cfg = pro_config.get("autofix", {}).get("validation", {})
+
+            # Resolver modelo: Priorizar config de Cerebro
+            model = cerebro_cfg.auto_fix_model or "deepseek-coder-v2:16b-lite-instruct-q4_K_M"
+            provider = cerebro_cfg.auto_fix_provider or "ollama"
+
             executor_result = await self._call_executor(
                 target_file=target_file,
                 instruction=instruction,
                 branch_prefix=branch_prefix,
                 workspace_root=settings.workspace_root,
+                model=model,
+                provider=provider,
+                run_tests=val_cfg.get("run_tests", True),
+                require_build=val_cfg.get("require_build", True),
             )
+            
+            # ── 4. Retornar inmediatamente (se procesa en Async Callback) ───────
+            logger.info("✅ Autofix aceptado por Executor y ejecutándose en background")
+            return {"ok": True, "status": "started", "autofix_id": autofix_id}
+            
         except httpx.ConnectError:
             logger.error("❌ Executor no disponible — autofix cancelado")
             await self._emit("autofix_failed", {
@@ -104,10 +128,6 @@ class AutofixClient:
                 "batch_id": batch_id,
             })
             return {"ok": False, "error": str(exc)}
-
-            # ── 3. Retornar inmediatamente (se procesa en Async Callback) ───────
-            logger.info("✅ Autofix aceptado por Executor y ejecutándose en background")
-            return {"ok": True, "status": "started", "autofix_id": autofix_id}
 
     async def process_autofix_result(self, event: Dict[str, Any]):
         """Procesa el resultado cuando Executor termina y reporta por /api/events"""
@@ -165,6 +185,10 @@ class AutofixClient:
         instruction: str,
         branch_prefix: str,
         workspace_root: str,
+        model: str,
+        provider: str,
+        run_tests: bool = True,
+        require_build: bool = True,
     ) -> Dict[str, Any]:
         """POST `{executor_url}/command` con action='autofix'."""
         request_id = f"autofix-{uuid.uuid4().hex[:8]}"
@@ -176,9 +200,11 @@ class AutofixClient:
                 "instruction": instruction,
                 "branch_prefix": branch_prefix,
                 "workspace_root": workspace_root,
-                "provider": "ollama",
-                "model": "qwen3:8b",
-                "cerebro_url": "http://localhost:4000"
+                "provider": provider,
+                "model": model,
+                "cerebro_url": "http://localhost:4000",
+                "run_tests": run_tests,
+                "require_build": require_build,
             },
         }
         logger.debug(f"→ Executor POST /command: {body}")
@@ -196,13 +222,32 @@ class AutofixClient:
         action: str,
         instruction: str,
         target_file: str = "",
+        active_project: str = "",
         context_files: List[str] = None
     ) -> Dict[str, Any]:
         """Dispara un request explícito desde el humano hacia el Executor."""
+        import os
         from app.config import get_settings
         settings = get_settings()
         workspace_root = settings.workspace_root
+
+        # Si se especificó un proyecto activo, resolver la ruta completa
+        if active_project and active_project not in ("", "Ninguno"):
+            candidate = active_project if os.path.isabs(active_project) else os.path.join(workspace_root, active_project)
+            if os.path.isdir(candidate):
+                workspace_root = candidate
+                logger.info(f"📂 [Interactive] workspace_root resuelto a proyecto: {workspace_root}")
+            else:
+                logger.warning(f"⚠️ [Interactive] Proyecto '{active_project}' no encontrado en {workspace_root}, usando root por defecto")
+        else:
+            logger.warning(f"⚠️ [Interactive] No se especificó active_project, Aider correrá en workspace_root: {workspace_root}")
         
+        # Resolver modelo: Priorizar config de Cerebro
+        from app.config_manager import UnifiedConfigManager
+        cerebro_cfg = UnifiedConfigManager.get_instance().get_config().cerebro
+        model = cerebro_cfg.auto_fix_model or "deepseek-coder-v2:16b-lite-instruct-q4_K_M"
+        provider = cerebro_cfg.auto_fix_provider or "ollama"
+
         request_id = f"{action}-{uuid.uuid4().hex[:8]}"
         body = {
             "action": action,
@@ -212,10 +257,12 @@ class AutofixClient:
                 "instruction": instruction,
                 "branch_prefix": f"skrymir-{action}/",
                 "workspace_root": workspace_root,
-                "provider": "ollama",
-                "model": "qwen3:8b",
+                "provider": provider,
+                "model": model,
                 "cerebro_url": "http://localhost:4000",
-                "context_files": context_files or []
+                "context_files": context_files or [],
+                "run_tests": True, # Interactivo suele querer validación por defecto
+                "require_build": True,
             },
         }
 

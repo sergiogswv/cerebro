@@ -90,9 +90,23 @@ async def select_project(request: Request):
     try:
         body = await request.json()
         project_name = body.get("project")
+        restart_agents = body.get("restart_agents", True)  # True por defecto para compatibilidad
+
         if not project_name:
             raise HTTPException(status_code=400, detail="project_name requerido")
-        logger.info(f"[SelectProject] Selecting project: {project_name}")
+
+        logger.info(f"[SelectProject] project={project_name} | restart_agents={restart_agents}")
+
+        if not restart_agents:
+            # Solo actualizar el nombre del proyecto activo sin iniciar/reiniciar agentes
+            orchestrator._projects._active_project = project_name
+            logger.info(f"[SelectProject] Sync silencioso: proyecto activo = '{project_name}' (sin reiniciar agentes)")
+            return ApiResponse(ok=True, message="Proyecto sincronizado (sin reiniciar agentes)", data={
+                "project": project_name,
+                "active_project": project_name,
+                "restart_agents": False
+            })
+
         result = await orchestrator.set_active_project(project_name)
         logger.info(f"[SelectProject] Result: {result}")
         return ApiResponse(ok=True, message="Proyecto seleccionado", data=result)
@@ -274,6 +288,61 @@ async def browse_directory(path: str = None):
     except Exception as e:
         logger.exception("Error navegando directorios")
         return ApiResponse(ok=False, message=f"Error: {str(e)}", data=None)
+
+
+@router.get("/project-tree", response_model=ApiResponse, summary="Explorar árbol del proyecto activo")
+async def get_project_tree(rel_path: str = ""):
+    """
+    Devuelve los archivos y carpetas del proyecto activo dada una sub-ruta (rel_path).
+    Sirve para mostrar un file browser del proyecto activo en el UI.
+    """
+    try:
+        settings = get_settings()
+        active_project = orchestrator.active_project
+        workspace = settings.workspace_root
+
+        if not active_project or not workspace:
+            return ApiResponse(ok=False, message="No hay proyecto activo", data=None)
+
+        base_path = os.path.join(workspace, active_project)
+        target_path = os.path.join(base_path, rel_path.lstrip("/\\"))
+
+        # Seguridad: evitar path traversal fuera del proyecto
+        if not os.path.abspath(target_path).startswith(os.path.abspath(base_path)):
+            return ApiResponse(ok=False, message="Ruta inválida (path traversal)", data=None)
+
+        if not os.path.exists(target_path):
+            return ApiResponse(ok=False, message=f"La ruta no existe: {rel_path}", data=None)
+
+        if not os.path.isdir(target_path):
+            return ApiResponse(ok=False, message="No es un directorio", data=None)
+
+        items = []
+        for item in sorted(os.listdir(target_path)):
+            if item.startswith(".git") or item == "node_modules":
+                continue  # ignorar directorios pesados/internos
+
+            full_item_path = os.path.join(target_path, item)
+            is_dir = os.path.isdir(full_item_path)
+            items.append({
+                "name": item,
+                "is_dir": is_dir,
+                "rel_path": os.path.relpath(full_item_path, base_path).replace("\\", "/")
+            })
+
+        # Ordenar: primero carpetas, luego archivos
+        items.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+
+        return ApiResponse(ok=True, message="Directorio leído", data={
+            "current_rel_path": rel_path,
+            "items": items
+        })
+
+    except Exception as e:
+        logger.exception(f"Error en /project-tree: {e}")
+        return ApiResponse(ok=False, message=f"Error: {str(e)}", data=None)
+
+
 
 
 def _is_likely_project(path: str) -> bool:

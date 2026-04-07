@@ -139,7 +139,7 @@ DEFAULT_DECISION_RULES = {
         "analysis_completed": {
             "base_severity": "warning",
             "description": "Análisis IA de Sentinel completado",
-            "extra_actions": [DecisionAction.CHAIN, DecisionAction.NOTIFY],
+            "extra_actions": [DecisionAction.CHAIN, DecisionAction.NOTIFY, DecisionAction.AUTOFIX],
             "chain_to": ["architect"],
         },
         "analysis_failed": {
@@ -156,7 +156,7 @@ DEFAULT_DECISION_RULES = {
         "sentinel_analysis_completed": {
             "base_severity": "warning",
             "description": "Análisis de Sentinel completado",
-            "extra_actions": [DecisionAction.CHAIN],
+            "extra_actions": [DecisionAction.CHAIN, DecisionAction.AUTOFIX],
             "chain_to": ["architect"],
         },
         "sentinel_file_change": {
@@ -205,7 +205,7 @@ DEFAULT_DECISION_RULES = {
     "autofix_rules": {
         "confidence_threshold": 0.8,
         "night_mode_reduced_threshold": 0.7,
-        "safe_issue_types": ["dead_code", "unused_import", "formatting", "simple_refactor"],
+        "safe_issue_types": ["dead_code", "unused_import", "formatting", "simple_refactor", "code_finding", "vulnerability_fix"],
         "require_validation": True,
     },
 }
@@ -635,8 +635,24 @@ class DecisionEngine:
         safe_types = autofix_rules.get("safe_issue_types", [])
 
         payload = event.get("payload", {})
+        
+        # Intentar extraer confianza del análisis si viene anidada
+        analysis = payload.get("analysis", {})
         confidence = payload.get("confidence", event.get("confidence", 0.0))
+        if confidence == 0.0 and analysis:
+            confidence = analysis.get("confidence", 0.0)
+            
         issue_type = payload.get("issue_type", "")
+        if not issue_type and analysis:
+            issue_type = analysis.get("issue_type", "")
+
+        # Si no hay issue_type pero hay hallazgos con fix sugerido, es propenso a autofix
+        findings = payload.get("findings", [])
+        if not issue_type and findings:
+            has_fix = any(f.get("auto_fixable") or f.get("suggestion") for f in findings)
+            if has_fix:
+                issue_type = "code_finding" # Tipo genérico seguro
+                if confidence == 0.0: confidence = 0.85 # Asumir alta si hay sugerencias explícitas
 
         # Nunca autofix si está configurado para suprimir (aprendizaje previo)
         if payload.get("suppress_autofix") or event.get("suppress_autofix"):
