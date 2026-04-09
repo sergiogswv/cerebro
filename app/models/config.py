@@ -17,7 +17,7 @@ class LLMConfig(BaseModel):
     patterns for sensitive values like API keys.
     """
 
-    provider: Literal["ollama", "openai", "gemini", "claude", "custom"] = Field(
+    provider: Literal["ollama", "openai", "gemini", "gemini-open-source", "claude", "custom"] = Field(
         description="LLM provider to use"
     )
     model: str = Field(description="Model name to use")
@@ -211,6 +211,14 @@ class CerebroConfig(BaseModel):
     auto_fix_model: str = Field(
         default="qwen3:8b",
         description="Model name for auto-fix operations"
+    )
+    auto_fix_base_url: Optional[str] = Field(
+        default=None,
+        description="Base URL for auto-fix LLM provider (optional, used for non-Ollama providers)"
+    )
+    auto_fix_api_key: Optional[str] = Field(
+        default=None,
+        description="API key for auto-fix LLM provider (required for cloud providers like Anthropic, OpenAI)"
     )
     isolation_branch_prefix: str = Field(
         default="skrymir-fix/",

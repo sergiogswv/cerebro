@@ -33,8 +33,9 @@ def _resolve_sentinel_url() -> str:
 
 
 AGENT_URLS: dict[str, str] = {
-    "sentinel":      _resolve_sentinel_url(),
-    "sentinel_adk":  settings.sentinel_adk_url,
+    "sentinel":      _resolve_sentinel_url(),  # Resuelve según sentinel_mode (core o adk)
+    "sentinel_core": settings.sentinel_url,    # Siempre apunta al Core (para comandos pro/monitor)
+    "sentinel_adk":  settings.sentinel_adk_url, # Siempre apunta al ADK
     "architect":     _resolve_architect_url(),
     "architect_adk": settings.architect_adk_url,
     "warden":        _resolve_warden_url(),

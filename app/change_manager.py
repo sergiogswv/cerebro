@@ -209,12 +209,13 @@ class ChangeManager:
         logger.info(f"✅ Cambio aprobado: {change_id} ({change.file_path})")
         return True
 
-    async def reject_change(self, change_id: str) -> bool:
+    async def reject_change(self, change_id: str, continue_pipeline: bool = False) -> bool:
         """
         Rechaza un cambio individual.
 
         Args:
             change_id: ID del cambio
+            continue_pipeline: Si True, Cerebro evalúa si continuar con Architect/Warden
 
         Returns:
             bool: True si se rechazó exitosamente
@@ -226,8 +227,6 @@ class ChangeManager:
         change = self._pending_changes[change_id]
         change.status = ChangeStatus.REJECTED
 
-        del self._pending_changes[change_id]
-
         # Registrar feedback negativo en ContextDB
         if self._orchestrator:
             self._orchestrator.context_db.record_decision_outcome(
@@ -237,8 +236,62 @@ class ChangeManager:
                 outcome_details="Usuario rechazó cambio sugerido",
             )
 
+            # Si continue_pipeline=True, evaluar si se debe continuar con Architect/Warden
+            if continue_pipeline:
+                await self._evaluate_rejection_pipeline(change)
+
+        del self._pending_changes[change_id]
+
         logger.info(f"❌ Cambio rechazado: {change_id} ({change.file_path})")
         return True
+
+    async def _evaluate_rejection_pipeline(self, change: PendingChange):
+        """
+        Evalúa si se debe continuar el pipeline tras un rechazo.
+        Usa el Decision Engine para determinar si Architect/Warden deben analizar el archivo.
+        """
+        try:
+            from app.decision_engine import DecisionEngine
+            from app.sockets import emit_agent_event
+
+            # Construir evento sintético para evaluación
+            rejection_event = {
+                "source": "human",
+                "type": "change_rejected",
+                "severity": change.severity,
+                "payload": {
+                    "file": change.file_path,
+                    "change_id": change.id,
+                    "original_event_id": change.event_id,
+                    "rejection_reason": "Usuario no está de acuerdo con la sugerencia",
+                }
+            }
+
+            # Obtener Decision Engine y evaluar
+            if hasattr(self._orchestrator, 'decision_engine'):
+                decision = await self._orchestrator.decision_engine.evaluate(
+                    rejection_event,
+                    context={"file_path": change.file_path}
+                )
+
+                # Si la decisión incluye CHAIN, disparar a Architect/Warden
+                from app.decision_engine import DecisionAction
+                if DecisionAction.CHAIN in decision.actions and decision.target_agents:
+                    logger.info(f"🔗 Rechazo en {change.file_path}: continuando pipeline a {decision.target_agents}")
+
+                    for agent in decision.target_agents:
+                        await emit_agent_event({
+                            "source": "cerebro",
+                            "type": f"pipeline_chain_to_{agent}",
+                            "severity": "info",
+                            "payload": {
+                                "file": change.file_path,
+                                "reason": "Evaluación post-rechazo",
+                                "original_change_id": change.id,
+                            }
+                        })
+        except Exception as exc:
+            logger.warning(f"⚠️ Error evaluando pipeline post-rechazo: {exc}")
 
     async def approve_all_pending(self) -> int:
         """
@@ -394,8 +447,9 @@ class ChangeManager:
                     self._orchestrator.active_project
                 ).replace("\\", "/")
 
+            # Enviar comando monitor SIEMPRE al Core, no al ADK
             ack = await send_command(
-                "sentinel",
+                "sentinel_core",
                 OrchestratorCommand(action="monitor", target=project_path)
             )
 

@@ -59,10 +59,24 @@ async def emit_agent_event(event_data: dict):
     Guarda eventos de interacción pendientes para clientes futuros.
     También guarda el estado de readiness de los agentes.
     """
+    import uuid
+    from datetime import datetime, timezone
+
+    # Asegurar que el evento tenga id y timestamp (requerido por el frontend)
+    if not event_data.get('id'):
+        event_data['id'] = str(uuid.uuid4())
+    if not event_data.get('timestamp'):
+        event_data['timestamp'] = datetime.now(timezone.utc).isoformat()
+
     try:
+        event_type = event_data.get('type', 'unknown')
+        event_source = event_data.get('source', 'unknown')
+        print(f"[SOCKET DEBUG] emit_agent_event llamado: source={event_source}, type={event_type}, id={event_data.get('id')}")
+
         # Validate event against schema
         validated = validate_event(event_data)
         event_with_metadata = validated.model_dump()
+        print(f"[SOCKET DEBUG] Evento validado correctamente")
 
         # Guardar estado de readiness de los agentes
         if event_data.get('type') in ['sentinel_ready', 'architect_ready', 'warden_ready',
@@ -77,15 +91,20 @@ async def emit_agent_event(event_data: dict):
             pending_interaction_events.append(event_with_metadata)
             logger.info(f"💾 Evento de interacción guardado (pendientes: {len(pending_interaction_events)})")
 
+        print(f"[SOCKET DEBUG] Emitiendo evento por Socket.IO...")
         await sio.emit('agent_event', event_with_metadata)
+        print(f"[SOCKET DEBUG] ✅ Evento emitido exitosamente: {event_type}")
         logger.debug(f"📤 Evento emitido por Socket.IO: {event_data.get('type')}")
 
     except EventValidationError as e:
         logger.warning(f"⚠️ Evento con schema inválido: {e}")
+        print(f"[SOCKET DEBUG] ⚠️ Schema inválido, emitiendo de todos modos: {e}")
         # Still emit but log the issue
         await sio.emit('agent_event', event_data)
+        print(f"[SOCKET DEBUG] ✅ Evento emitido (con warning de schema)")
     except Exception as e:
         logger.error(f"❌ Error emitiendo por Socket.IO: {e}")
+        print(f"[SOCKET DEBUG] ❌ Error emitiendo: {e}")
 
 async def emit_system_status(status_data: dict):
     """

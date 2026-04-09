@@ -311,13 +311,54 @@ async def consultar_ia(prompt: str, ai_config: AIConfig) -> Optional[str]:
                     logger.error(f"Error en request: {e}")
                     return None
 
-            # Gemini (Google)
-            elif "gemini" in provider:
+            # Gemini Open Source (Gemma) - Native Google AI API
+            elif provider == "gemini-open-source":
                 url = f"{ai_config.api_url.rstrip('/')}/v1beta/models/{ai_config.model}:generateContent?key={ai_config.api_key}"
                 headers = {"content-type": "application/json"}
                 body = {
                     "contents": [{"parts": [{"text": prompt}]}]
                 }
+                logger.info(f"[Gemini-OS] POST {url[:80]}... model={ai_config.model}")
+                resp = await client.post(url, headers=headers, json=body)
+                resp.raise_for_status()
+                data = resp.json()
+                logger.debug(f"Gemini-OS raw response: {json.dumps(data)[:500]}...")
+
+                # Handle response with 'thought' field (Gemma models)
+                # Response has multiple parts: first may be thought, second is actual text
+                parts = data["candidates"][0]["content"]["parts"]
+                logger.debug(f"Gemini-OS response has {len(parts)} parts")
+
+                # Find the part that is NOT a thought (the actual response)
+                text_content = None
+                for i, part in enumerate(parts):
+                    if isinstance(part, dict):
+                        is_thought = part.get("thought", False)
+                        logger.debug(f"Part {i}: thought={is_thought}")
+                        if not is_thought:
+                            text_content = part.get("text")
+                            break
+
+                # Fallback: if all parts have thought or no text found, use last part
+                if not text_content and parts:
+                    last_part = parts[-1]
+                    if isinstance(last_part, dict):
+                        text_content = last_part.get("text", "")
+                        logger.debug("Using last part as fallback")
+
+                logger.info(f"[Gemini-OS] Extracted text (thought filtered): {text_content[:100] if text_content else 'None'}...")
+                return text_content
+
+            # Gemini (Google) - Flash/Pro using library or HTTP
+            elif provider == "gemini":
+                # For Gemini Flash/Pro, use the OpenAI-compatible endpoint
+                # which works better than the native API for simpler use cases
+                url = f"{ai_config.api_url.rstrip('/')}/v1beta/models/{ai_config.model}:generateContent?key={ai_config.api_key}"
+                headers = {"content-type": "application/json"}
+                body = {
+                    "contents": [{"parts": [{"text": prompt}]}]
+                }
+                logger.info(f"[Gemini] POST model={ai_config.model}")
                 resp = await client.post(url, headers=headers, json=body)
                 resp.raise_for_status()
                 data = resp.json()

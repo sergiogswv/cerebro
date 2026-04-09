@@ -138,10 +138,22 @@ async def sentinel_command(request: Request):
     if target and target != "Ninguno":
         project_path = os.path.join(orchestrator.workspace_root, target).replace("\\", "/")
 
-    ack = await send_raw_command("sentinel", {
+    # Obtener configuración para determinar si auto_mode está habilitado
+    from app.config_manager import UnifiedConfigManager
+    manager = UnifiedConfigManager.get_instance()
+    unified_config = manager.get_config()
+    cerebro_config = unified_config.cerebro if hasattr(unified_config, 'cerebro') else None
+    is_auto = cerebro_config.auto_fix_enabled if cerebro_config else False
+
+    logger.info(f"🔧 Sentinel command: subcommand={subcommand}, auto_mode={is_auto}")
+
+    # Enviar siempre al Core (sentinel_core), no al ADK
+    # Los comandos pro/monitor solo existen en el Core, no en el ADK
+    ack = await send_raw_command("sentinel_core", {
         "action": action, "subcommand": subcommand,
         "target": project_path,
         "request_id": f"sentinel-{uuid.uuid4().hex[:8]}",
+        "options": {"auto": is_auto},
     })
     if isinstance(ack, dict) and ack.get("status") == "rejected":
         return ApiResponse(ok=False, message=ack.get("error", "Comando rechazado"))
@@ -192,9 +204,19 @@ async def _sentinel_monitor(action: str, target: str, request: Request):
         full = os.path.join(orchestrator.workspace_root, proj)
         t = full.replace("\\", "/") if os.path.isabs(full) else proj
 
-    ack = await send_raw_command("sentinel", {
+    # Obtener configuración para determinar si auto_mode está habilitado
+    from app.config_manager import UnifiedConfigManager
+    manager = UnifiedConfigManager.get_instance()
+    unified_config = manager.get_config()
+    cerebro_config = unified_config.cerebro if hasattr(unified_config, 'cerebro') else None
+    is_auto = cerebro_config.auto_fix_enabled if cerebro_config else False
+
+    # Enviar siempre al Core (sentinel_core), no al ADK
+    # Los comandos monitor/* solo existen en el Core, no en el ADK
+    ack = await send_raw_command("sentinel_core", {
         "action": f"monitor/{action}", "target": t,
         "request_id": f"{action}-{uuid.uuid4().hex[:8]}",
+        "options": {"auto": is_auto},
     })
 
     event_type = action.replace("-", "_")

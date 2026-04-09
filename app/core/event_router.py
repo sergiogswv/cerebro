@@ -1,11 +1,14 @@
 """Event Router - Routes events to appropriate handlers."""
 
 import logging
+import uuid
+import re as _re
+from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 
 from app.decision_engine import DecisionEngine, DecisionAction
-from app.models import AgentEvent
-from app.dispatcher import notify
+from app.dispatcher import notify, send_command, send_raw_command
+from app.models import AgentEvent, OrchestratorCommand
 from app.sockets import emit_agent_event
 from app.context_db import ContextDB
 
@@ -27,16 +30,64 @@ class EventRouter:
         self.decision_engine = decision_engine
         self.context_db = context_db
         self._handlers: Dict[str, Any] = {}
+        # 🔥 Bloqueo para evitar bucles infinitos en modo autónomo
+        # { "project_root": timestamp_of_last_dispatch }
+        self._active_processing: Dict[str, float] = {}
+        self._debounce_window = 180.0 # 3 minutos (suficiente para la mayoría de los saltos de Aider)
+        # 🛡️ Lock de async para evitar race conditions en el de-bounce
+        import asyncio
+        self._route_lock = asyncio.Lock()
+        # 🛡️ Cache para evitar duplicados de reportes de Sentinel (ADK/Core)
+        # { "file_path": (timestamp, findings_hash) }
+        self._sentinel_reports_cache: Dict[str, Any] = {}
 
     async def route(self, event: AgentEvent) -> Dict[str, Any]:
+        async with self._route_lock:
+            return await self._route_internal(event)
+
+    async def _route_internal(self, event: AgentEvent) -> Dict[str, Any]:
         """
         Route an event to appropriate handlers.
 
         Returns:
             Dict with actions taken
         """
-        # Emit to dashboard first
-        await emit_agent_event(event.model_dump(mode="json"))
+        # ── EVENTOS DE EXECUTOR (Control de ciclo de vida de fixes) ──
+        if event.source == "executor" and event.type in ("task_completed", "task_failed", "autofix_completed", "autofix_failed", "feature_completed", "feature_failed", "bugfix_completed", "bugfix_failed"):
+            file_path = event.payload.get("target") or event.payload.get("file")
+            logger.info(f"✅ [Cerebro] Executor terminó {event.type} para {file_path}. Reanudando Sentinel...")
+            
+            # 1. Quitar bloqueo local (buscando el proyecto base)
+            if file_path:
+                fp_norm = file_path.replace("\\", "/").lower().rstrip("/")
+                # Intentar limpiar bloqueos que contengan esta ruta o viceversa
+                to_remove = []
+                for k in self._active_processing.keys():
+                    k_norm = k.replace("\\", "/").lower().rstrip("/")
+                    if k_norm in fp_norm or fp_norm in k_norm:
+                        to_remove.append(k)
+                
+                for k in to_remove:
+                    self._active_processing.pop(k, None)
+                    logger.info(f"🔓 [Cerebro] Bloqueo liberado para {k}")
+            
+            # 2. Reanudar monitoreo en Sentinel Core
+            await send_command("sentinel_core", OrchestratorCommand(action="monitor/resume"))
+            
+            # 3. Disparar una re-validación inmediata si fue un éxito
+            if event.type.endswith("_completed") and file_path:
+                logger.info(f"🔍 [Cerebro] Disparando re-análisis de verificación para {file_path}")
+                await send_command("sentinel_core", OrchestratorCommand(action="analyze", target=file_path))
+            
+            # 4. Notificar al dashboard antes de terminar
+            await emit_agent_event(event.model_dump(mode="json"))
+                
+            return {"action": "resume_cycle", "status": "completed"}
+
+        # Emit to dashboard first (except for file_change which is decorated below
+        # and analysis_completed which has its own de-duplication logic)
+        if not (event.source == "sentinel" and event.type == "file_change") and event.type != "analysis_completed":
+            await emit_agent_event(event.model_dump(mode="json"))
 
         logger.info(
             f"📥 [{event.source.upper()}] type={event.type} "
@@ -44,13 +95,234 @@ class EventRouter:
         )
 
         result = {"event_id": event.id, "actions": []}
+
+        # ── EVENTOS DE SENTINEL CORE (file_change) ──
+        # Cuando Sentinel Core detecta cambio de archivo
+        if event.type == "file_change" and event.source == "sentinel":
+            from app.config import get_settings
+            import uuid
+            settings = get_settings()
+            file_path = event.payload.get("file", "unknown")
+
+            # 🛑 VALIDAR DEBOUNCE: Si ya estamos procesando este proyecto, ignoramos
+            import time
+            now = time.time()
+            
+            logger.info(f"👀 [Cerebro] Sentinel Core reportó cambio: {file_path}")
+
+            # SIEMPRE emitir evento al timeline para que aparezca en dashboard
+            # Hacemos esto ANTES del bloqueo para que el usuario vea que Sentinel detectó el cambio
+            await emit_agent_event({
+                "source": "sentinel",
+                "type": "file_change",
+                "severity": event.severity,
+                "timestamp": event.timestamp or datetime.now(timezone.utc).isoformat(),
+                "id": event.id,
+                "payload": {
+                    "original_event_id": event.id,
+                    "file": file_path,
+                    "message": event.payload.get("message", f"Archivo modificado: {file_path}"),
+                }
+            })
+
+            # 🛑 VALIDAR DEBOUNCE: Si ya estamos procesando este proyecto, ignoramos el ANÁLISIS AUTOMÁTICO
+            import time
+            now = time.time()
+            file_path_norm = file_path.replace("\\", "/").lower()
+            
+            is_locked = False
+            for locked_root, lock_time in self._active_processing.items():
+                locked_root_norm = locked_root.replace("\\", "/").lower()
+                if file_path_norm.startswith(locked_root_norm) or locked_root_norm in file_path_norm:
+                    elapsed = now - lock_time
+                    if elapsed < self._debounce_window:
+                        logger.info(f"⏳ [Cerebro] Ignorando ANÁLISIS de {file_path} (Proyecto {locked_root} bloqueado: {elapsed:.1f}s restan)")
+                        return {"action": "debounce_active", "status": "skipped"}
+                    is_locked = True
+                    break
+            
+            if is_locked:
+                to_del = [k for k, v in self._active_processing.items() if (now - v) >= self._debounce_window]
+                for k in to_del: del self._active_processing[k]
+
+            # Si estamos en modo ADK, reenviar al ADK para análisis LLM
+            if settings.sentinel_mode == "adk":
+                logger.info(f"📡 [Cerebro] Reenviando a ADK para análisis LLM: {file_path}")
+
+                # Emitir evento de transición
+                await emit_agent_event({
+                    "source": "cerebro",
+                    "type": "sentinel_core_to_adk",
+                    "severity": "info",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "id": f"transition-{event.id[:8]}", # ID derivado
+                    "payload": {
+                        "original_event_id": event.id,
+                        "file": file_path,
+                        "message": "Core detectó cambio, reenviando a ADK",
+                    }
+                })
+
+                # Reenviar al ADK para análisis
+                adk_result = await self._forward_to_sentinel_adk(event)
+                result["actions"].append(adk_result)
+
+        # ── EVENTOS DE SENTINEL (ADK o CORE) CON TAREA SELECCIONADA ──
+        # Cuando Sentinel analiza y selecciona una tarea (ya sea vía ADK o via Core Rust)
+        is_sentinel_completed = (event.type.startswith("sentinel_") and event.type.endswith("_completed")) or (event.type == "analysis_completed")
         
+        if is_sentinel_completed:
+            payload = event.payload or {}
+            file_hint = payload.get("file")
+
+            # 🛡️ DE-DUPLICACIÓN: Si el contenido es idéntico al último reporte (hace < 60s), ignoramos
+            import hashlib
+            import time
+            import re
+            
+            # Normalizar findings: ignorar números de línea y espacios extras para el hash
+            findings_text = str(payload.get("finding") or payload.get("findings") or "")
+            normalized_findings = re.sub(r'L\d+(-L\d+)?', '', findings_text) # Quitar L123 o L123-L125
+            normalized_findings = re.sub(r':\d+', ':', normalized_findings)    # Quitar :123
+            normalized_findings = "".join(normalized_findings.split())       # Quitar todos los espacios
+            
+            findings_hash = hashlib.md5(normalized_findings.encode()).hexdigest()
+            
+            if file_hint:
+                last_time, last_hash = self._sentinel_reports_cache.get(file_hint, (0, ""))
+                if last_hash == findings_hash and (time.time() - last_time) < 120:
+                    logger.info(f"♻️ [Cerebro] Ignorando reporte duplicado (hash estable) para {file_hint}")
+                    return result
+                
+                # Actualizar cache
+                self._sentinel_reports_cache[file_hint] = (time.time(), findings_hash)
+
+            # 🛑 VALIDAR BLOQUEO: Si el proyecto está en active_processing, ignoramos reportes
+            if file_hint:
+                now = time.time()
+                file_hint_norm = file_hint.replace("\\", "/").lower()
+                for locked_root, lock_time in self._active_processing.items():
+                    locked_root_norm = locked_root.replace("\\", "/").lower()
+                    if file_hint_norm.startswith(locked_root_norm) or locked_root_norm in file_hint_norm:
+                        if (now - lock_time) < self._debounce_window:
+                            logger.info(f"⏳ [Cerebro] Ignorando reporte para {file_hint} (Proyecto {locked_root} en Fix)")
+                            return result
+
+            # Emitir al dashboard (ahora que sabemos que no es duplicado ni bloqueado)
+            await emit_agent_event(event.model_dump(mode="json"))
+            
+            # Soporte tanto para 'finding' (ADK estructurado) como 'findings' (Core Rust / Legacy)
+            task_raw = payload.get("finding") or payload.get("findings")
+            
+            # Limpiar tarea si es un bloque enorme (común en Core Rust)
+            task_selected = task_raw
+            if task_raw and len(task_raw) > 300:
+                # Intentar extraer el primer punto de una lista o la primera oración significativa
+                lines = [l.strip() for l in task_raw.split('\n') if l.strip()]
+                for line in lines:
+                    # Buscar líneas que parezcan tareas (empiecen con bullet, o tengan palabras clave)
+                    if line.startswith(('-', '*', '1.', '###', '####')):
+                        # Ignorar encabezados genéricos
+                        if any(h in line.lower() for h in ["análisis", "analisis", "arquitectura", "calidad"]):
+                            continue
+                        task_selected = line.lstrip('-*#123456789. \t')
+                        break
+                    elif any(k in line.lower() for k in ["error", "vulnerabilidad", "bug", "refactor"]):
+                        task_selected = line
+                        break
+                
+                # Si falló la extracción, al menos truncar o tomar el primer párrafo
+                if task_selected == task_raw:
+                    task_selected = task_raw.split('\n\n')[0][:500]
+                    if len(task_selected) < 20 and len(task_raw) > 20: # Probablemente un título
+                        task_selected = task_raw[:500]
+
+            task_type = payload.get("task_type")
+            task_priority = payload.get("task_priority") or "medium"
+            file_hint = payload.get("file")
+            original_count = payload.get("original_findings_count", 1)
+
+            # Fallback para tareas sin tipo (común en eventos directos del Core Rust)
+            if task_selected and not task_type:
+                logger.info(f"ℹ️ [Cerebro] Tarea sin tipo explícito (posible Core Rust), asignando 'refactor' por defecto")
+                task_type = "refactor"
+                
+                # Inferencia de tipo y prioridad basada en contenido (para Core Rust)
+                tl = str(task_selected).lower()
+                if any(w in tl for w in ["seguridad", "security", "vulnerabilidad", "vulnerability", "crítico", "critico", "critical"]):
+                    task_type = "security"
+                    task_priority = "critical" if "critic" in tl else "high"
+                elif any(w in tl for w in ["bug", "error", "fallo"]):
+                    task_type = "bugfix"
+                    task_priority = "high"
+                elif any(w in tl for w in ["propuesta", "sugerencia", "mejora", "style"]):
+                    task_type = "refactor"
+                    task_priority = "low"
+
+            # Solo procesar si hay una tarea válida
+            if not task_selected or not task_type:
+                logger.warning(f"⚠️ [Cerebro] Evento {event.type} ignorado para despacho: no contiene tarea válida. (task_selected={task_selected is not None}, task_type={task_type})")
+                return result
+
+            if self._is_auto_mode_enabled():
+                logger.info(f"🎯 [Cerebro] Tarea detectada para ejecución: {task_type} ({task_priority})")
+
+                await emit_agent_event({
+                    "source": "executor", # Antes 'cerebro', para que aparezca en la columna Warden & Executor
+                    "type": "sentinel_task_selected",
+                    "severity": "info" if task_priority not in ["critical", "high"] else "warning",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "payload": {
+                        "original_event_id": event.id,
+                        "task_type": task_type,
+                        "priority": task_priority,
+                        "selected_task": task_selected,
+                        "recommendation": task_selected, # 🔥 Duplicamos como 'recommendation' para activar botones en el dashboard
+                        "file": file_hint,
+                        "message": f"Tarea {task_type} seleccionada de Sentinel",
+                    }
+                })
+
+                # 🔥 REGISTRAR BLOQUEO: Este proyecto entra en ventana de fix
+                if file_hint:
+                    # Intentar deducir la raíz del proyecto para bloquearlo entero
+                    # Si no, bloquear el archivo y sus alrededores
+                    project_root = file_hint
+                    try:
+                        import os
+                        if os.path.isfile(file_hint):
+                            # Buscar package.json hacia arriba (simplificado)
+                            curr = os.path.dirname(file_hint)
+                            for _ in range(5):
+                                if any(os.path.exists(os.path.join(curr, f)) for f in ["package.json", "Cargo.toml", ".git"]):
+                                    project_root = curr
+                                    break
+                                parent = os.path.dirname(curr)
+                                if parent == curr: break
+                                curr = parent
+                    except: pass
+
+                    project_root_norm = project_root.replace("\\", "/").lower()
+                    self._active_processing[project_root_norm] = time.time()
+                    logger.info(f"🔒 [Cerebro] Bloqueando re-análisis en PROYECTO {project_root_norm} por {self._debounce_window}s")
+
+                # Enviar tarea a Executor
+                # IMPORTANTE: Enviamos 'task_raw' para que Aider tenga el contexto completo del error,
+                # mientras que 'task_selected' se usó solo para el resumen visual en el Dashboard.
+                executor_result = await self._dispatch_to_executor(event, task_raw or task_selected, file_hint, task_type)
+                result["actions"].append(executor_result)
+
+                return result
+
         # ── EVENTOS DE RESULTADO AUTÓMATA (AUTOFIX CALLBACK) Y MANUAL ──
         if event.type in (
             "autofix_completed", "autofix_failed",
             "feature_completed", "feature_failed",
             "bugfix_completed", "bugfix_failed"
         ):
+            # NOTA: No hacemos el release del lock aquí para no duplicar lógica.
+            # El bloque de arriba en _route_internal ahora maneja el release para estos eventos.
+            
             from app.autofix_client import get_autofix_client
             client = get_autofix_client()
             status, branch, target = await client.process_autofix_result(event.model_dump(mode="json"))
@@ -102,10 +374,9 @@ class EventRouter:
                         await notify(f"✨ **Integración de {event.type.split('_')[0]} aplicada y mergeada:** `{target}`", level="info")
                         result["actions"].append({"action": "auto_merge", "status": "success", "branch": branch})
                         
-                        # Si es interactivo (feature/bugfix), enviar al Tribunal de Agentes en paralelo
-                        if not event.type.startswith("autofix"):
-                            import asyncio
-                            asyncio.create_task(self._trigger_tribunal(repo_dir, target, target_abs))
+                        # Enviar al Tribunal de Agentes en paralelo para validación multi-agente
+                        import asyncio
+                        asyncio.create_task(self._trigger_tribunal(repo_dir, target, target_abs))
 
                     else:
                         logger.warning(f"⚠️ Fallo al hacer merge automático: {res.stderr}")
@@ -122,6 +393,9 @@ class EventRouter:
                 
             return result
 
+        # ── RUTEO ESTÁNDAR PARA EL RESTO DE EVENTOS ──
+        return await self._evaluate_standard(event)
+
     async def _trigger_tribunal(self, repo_dir: str, target: str, target_abs: str):
         """Dispara de manera encadenada a Sentinel, Architect y Warden tras la implementación de un requerimiento manual."""
         from app.dispatcher import send_raw_command
@@ -136,9 +410,9 @@ class EventRouter:
         logger.info(f"⚖️ Iniciando TRIBUNAL multi-agente para {target}")
 
         try: 
-            # 1. Sentinel
+            # 1. Sentinel (siempre al Core, no al ADK)
             logger.info("⚖️ -> Ejecutando Sentinel...")
-            ack_sentinel = await send_raw_command("sentinel", {
+            ack_sentinel = await send_raw_command("sentinel_core", {
                 "action": "pro", "subcommand": "check",
                 "target": target_abs or repo_dir,
                 "request_id": f"sentinel-{uuid.uuid4().hex[:8]}"
@@ -399,6 +673,10 @@ class EventRouter:
         Dispara un autofix automático vía AutofixClient.
         El AutofixClient se comunica con Executor → Aider → Validación.
         Solo Cerebro habla con Executor (principio arquitectónico).
+
+        IMPORTANTE: Si el evento tiene múltiples findings, selecciona SOLO UNO
+        para evitar que Aider intente resolver todo a la vez y termine haciendo
+        cambios inconsistentes o incompletos.
         """
         from app.autofix_client import get_autofix_client
         from app.proactive_scheduler import get_proactive_scheduler
@@ -413,11 +691,28 @@ class EventRouter:
             logger.info("🚫 Autofix deshabilitado en configuración — ignorando")
             return {"action": "autofix", "status": "disabled"}
 
+        # Convertir evento a dict para evaluación
+        event_dict = event.model_dump(mode="json")
+
         # Verificar confianza vs. threshold
         night_mode = scheduler.is_night_mode_active(config)
-        if not self.decision_engine.should_autofix(event.model_dump(mode="json"), night_mode):
+        if not self.decision_engine.should_autofix(event_dict, night_mode):
             logger.info("🚫 should_autofix=False — no se dispara autofix")
             return {"action": "autofix", "status": "skipped", "reason": "below_threshold"}
+
+        # ── SELECCIÓN DE TAREA ÚNICA ──────────────────────────────────────────
+        # Si hay múltiples findings, seleccionar solo uno para esta iteración
+        selected_event = self.decision_engine.select_single_task(event_dict)
+        if selected_event is None:
+            logger.warning("⚠️ No hay findings procesables para autofix")
+            return {"action": "autofix", "status": "skipped", "reason": "no_findings"}
+
+        # Si se seleccionó un finding de un batch, loguearlo
+        if selected_event.get("payload", {}).get("selected_from_batch"):
+            orig_count = selected_event.get("payload", {}).get("original_findings_count", 0)
+            remaining = selected_event.get("payload", {}).get("remaining_count", 0)
+            logger.info(f"   📋 Iteración actual: 1/{orig_count} findings ({remaining} pendientes)")
+        # ──────────────────────────────────────────────────────────────────────
 
         batch_id = event.payload.get("batch_id") if event.payload else None
         logger.info(f"🔧 Disparando autofix para evento {event.type} (batch={batch_id})")
@@ -425,7 +720,7 @@ class EventRouter:
         try:
             client = get_autofix_client()
             result = await client.trigger_autofix(
-                event=event.model_dump(mode="json"),
+                event=selected_event,  # Usar evento con finding único seleccionado
                 batch_id=batch_id,
             )
             logger.info(f"✅ Autofix completado: {result.get('status')} | branch={result.get('branch')}")
@@ -459,6 +754,248 @@ class EventRouter:
         except Exception as e:
             logger.error(f"Interaction error: {e}")
             return {"action": "interaction", "status": "error", "error": str(e)}
+
+    def _is_auto_mode_enabled(self) -> bool:
+        """Verifica si el modo autónomo está habilitado en la configuración."""
+        try:
+            from app.config_manager import UnifiedConfigManager
+            manager = UnifiedConfigManager.get_instance()
+            unified_config = manager.get_config()
+            cerebro_config = unified_config.cerebro if hasattr(unified_config, 'cerebro') else None
+            return cerebro_config.auto_fix_enabled if cerebro_config else False
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo verificar auto_mode: {e}")
+            return False
+
+    async def _forward_to_sentinel_adk(self, event: AgentEvent) -> Dict:
+        """
+        Reenvía un evento file_change del Core al ADK para análisis LLM.
+        """
+        from app.dispatcher import send_command
+        from app.models import OrchestratorCommand
+
+        file_path = event.payload.get("file") if event.payload else None
+        if not file_path:
+            logger.warning("⚠️ [Cerebro] Evento file_change sin archivo, no se puede reenviar a ADK")
+            return {"action": "forward_to_adk", "status": "skipped", "reason": "no_file"}
+
+        logger.info(f"🔄 [Cerebro] Reenviando archivo a Sentinel ADK: {file_path}")
+
+        try:
+            # Enviar comando al ADK para análisis del archivo
+            ack = await send_command(
+                "sentinel_adk",
+                OrchestratorCommand(
+                    action="check",
+                    target=file_path,
+                    options={"auto": True, "triggered_by": "file_change"}
+                )
+            )
+
+            if ack.get("status") == "completed":
+                logger.info(f"✅ [Cerebro] ADK completó análisis de {file_path}")
+                return {
+                    "action": "forward_to_adk",
+                    "status": "success",
+                    "file": file_path,
+                    "adk_result": ack.get("result")
+                }
+            else:
+                logger.warning(f"⚠️ [Cerebro] ADK no completó análisis: {ack.get('error', 'Unknown error')}")
+                return {
+                    "action": "forward_to_adk",
+                    "status": "failed",
+                    "file": file_path,
+                    "error": ack.get("error")
+                }
+
+        except Exception as exc:
+            logger.error(f"❌ [Cerebro] Error reenviando a ADK: {exc}")
+            return {
+                "action": "forward_to_adk",
+                "status": "error",
+                "file": file_path,
+                "error": str(exc)
+            }
+
+    async def _dispatch_to_executor(self, event: AgentEvent, task_description: str, file_hint: str | None, task_type: str) -> Dict:
+        """
+        Envía una tarea seleccionada por Sentinel ADK al Executor para ejecución automática.
+        """
+        import uuid
+        from datetime import datetime, timezone
+
+        logger.info(f"🚀 [Cerebro] Enviando tarea a Executor: {task_type}")
+
+        # Determinar acción: 'autofix' usa Aider, 'run' para otras tareas
+        # Incluimos permanentemente maintainability y refactor en autofix
+        is_autofix = task_type in ["bugfix", "security", "autofix", "maintainability", "refactor"]
+        action = "autofix" if is_autofix else "run"
+
+        # Obtener prioridad desde el evento original si existe
+        payload_orig = event.payload or {}
+        task_priority = payload_orig.get("task_priority") or payload_orig.get("priority", "medium")
+
+        # 1. Ya no pausamos Sentinel Core físicamente (Cerebro ya bloquea el re-análisis via _active_processing)
+        # Esto evita que Sentinel se quede pausado permanentemente si falla la notificación de finalización.
+        logger.info("🛡️ [Cerebro] Manteniendo Sentinel Core activo (Lock lógico aplicado en Cerebro)")
+
+        # Construir el comando para Executor (formato compatible con handle_command en executor/app/routes.py)
+        from app.config import get_settings
+        from app.config_manager import UnifiedConfigManager
+        
+        settings = get_settings()
+        manager = UnifiedConfigManager.get_instance()
+        unified_config = manager.get_config()
+        
+        # 1. Prioridad: Valores configurados dinámicamente desde el Dashboard
+        # 2. Fallback: Valores de variables de entorno (Settings)
+        # 3. Fallback final: Hardcoded defaults
+        
+        # Obtener cerebro config si existe en el unified config
+        cerebro_conf = getattr(unified_config, 'cerebro', None)
+        global_llm = unified_config.global_config.get("llm", {}) if hasattr(unified_config, 'global_config') else {}
+        
+        # 1. Resolver Provider
+        provider = (getattr(cerebro_conf, 'auto_fix_provider', None) or 
+                    global_llm.get("provider") or
+                    settings.autofix_llm_provider or 
+                    "ollama")
+        
+        # 2. Resolver Model
+        model = (getattr(cerebro_conf, 'auto_fix_model', None) or 
+                 global_llm.get("model") or
+                 settings.autofix_llm_model or 
+                 "deepseek-coder-v2:16b-lite-instruct-q4_K_M")
+        
+        # 3. Resolver Base URL
+        base_url = (getattr(cerebro_conf, 'auto_fix_base_url', None) or 
+                    global_llm.get("base_url") or
+                    settings.autofix_api_base or "")
+        
+        # 4. Resolver API Key
+        api_key = (getattr(cerebro_conf, 'auto_fix_api_key', None) or 
+                   global_llm.get("api_key") or
+                   settings.autofix_api_key or "")
+
+        executor_payload = {
+            "action": action,
+            "service": payload_orig.get("service") or payload_orig.get("origin") or "default",
+            "target": file_hint or payload_orig.get("target"),
+            "request_id": f"cerebro-sentinel-{event.id[:8]}",
+            "options": {
+                "instruction": task_description,
+                "priority": task_priority,
+                "auto_approve": True,
+                "context_files": [file_hint] if file_hint else [],
+                "max_build_retries": 5,
+                "require_build": True,
+                # 🔥 Configuración dinámica de LLM resuelta
+                "provider": str(provider),
+                "model": str(model),
+                "api_key": str(api_key),
+                "base_url": str(base_url)
+            }
+        }
+
+        logger.info(f"📤 [Cerebro] Despachando a Executor ({action}): {model} via {provider}")
+        logger.debug(f"DEBUG Payload: {executor_payload}")
+
+        # Emitir evento de inicio de ejecución al timeline
+        await emit_agent_event({
+            "source": "executor", # Antes 'cerebro', cambiado para aparecer en la columna correcta
+            "type": "executor_task_dispatched",
+            "severity": "info",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "payload": {
+                "original_event_id": event.id,
+                "task_type": task_type,
+                "task_description": task_description[:200] if len(task_description) > 200 else task_description,
+                "file": file_hint,
+                "executor_request_id": executor_payload["request_id"],
+                "message": f"Tarea enviada a Executor: {task_type} (acción: {action})",
+            }
+        })
+
+        # Enviar comando a Executor
+        try:
+            result = await send_raw_command("ejecutor", executor_payload)
+
+            # El Executor retorna un ApiResponse(ok, message, data: CommandAck)
+            success = result.get("ok") is True
+            data = result.get("data") or {}
+            status = data.get("status", "unknown") if success else result.get("status", "error")
+
+            # Emitir resultado al timeline
+            await emit_agent_event({
+                "source": "executor",
+                "type": "executor_task_completed" if success else "executor_task_failed",
+                "severity": "success" if success else "error",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "payload": {
+                    "original_event_id": event.id,
+                    "executor_request_id": executor_payload["request_id"],
+                    "task_type": task_type,
+                    "status": status,
+                    "result": data.get("result") if success else None,
+                    "error": data.get("error") or result.get("message") if not success else None,
+                    "message": f"Ejecución {'aceptada' if success else 'fallida'}: {task_type}",
+                }
+            })
+
+            if success:
+                logger.info(f"✅ [Cerebro] Tarea ejecutada exitosamente por Executor")
+                await notify(
+                    f"✅ **Tarea {task_type} ejecutada automáticamente**\n📁 `{file_hint or 'N/A'}`\n📝 {task_description[:100]}...",
+                    level="info",
+                    source="cerebro"
+                )
+            else:
+                logger.warning(f"⚠️ [Cerebro] Executor reportó error: {result.get('error')}")
+                await notify(
+                    f"⚠️ **Tarea {task_type} requiere atención**\nExecutor reportó: {result.get('error', 'Error desconocido')}",
+                    level="warning",
+                    source="cerebro"
+                )
+
+            return {
+                "action": "dispatch_to_executor",
+                "status": status,
+                "executor_request_id": executor_payload["request_id"],
+                "task_type": task_type,
+                "file": file_hint,
+                "result": result,
+            }
+
+        except Exception as exc:
+            logger.error(f"❌ [Cerebro] Error enviando tarea a Executor: {exc}")
+
+            # Emitir error al timeline
+            await emit_agent_event({
+                "source": "cerebro",
+                "type": "executor_task_failed",
+                "severity": "error",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "payload": {
+                    "original_event_id": event.id,
+                    "task_type": task_type,
+                    "error": str(exc),
+                    "message": f"Error enviando tarea a Executor: {exc}",
+                }
+            })
+
+            await notify(
+                f"❌ **Error enviando tarea a Executor:** `{exc}`",
+                level="error",
+                source="cerebro"
+            )
+
+            return {
+                "action": "dispatch_to_executor",
+                "status": "error",
+                "error": str(exc),
+                "task_type": task_type,
+            }
 
     def _build_message(self, event: AgentEvent) -> str:
         """Build human-readable message from event."""

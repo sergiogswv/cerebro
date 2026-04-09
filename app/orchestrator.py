@@ -234,34 +234,65 @@ class Orchestrator:
                         # Wait for ADK to be ready
                         await asyncio.sleep(2)
 
-                        # Step 2: Send command to ADK (which uses Core internally)
+                        # Step 2: Send command "open" to ADK
                         try:
                             ack = await asyncio.wait_for(
                                 send_command(
                                     adk_service_name,
-                                    OrchestratorCommand(action="monitor" if agent_name == "sentinel" else "open", target=project_path)
+                                    OrchestratorCommand(action="open", service=adk_service_name)
                                 ),
                                 timeout=10.0
                             )
 
                             if ack.get("status") != "rejected":
-                                if agent_name == "sentinel":
-                                    self._projects.set_monitored(project_name)
-                                    logger.info(f"Sentinel ADK monitoring: {project_name}")
-
-                                from app.sockets import emit_agent_event
-                                await emit_agent_event({
-                                    "source": agent_name,
-                                    "type": f"{agent_name}_adk_ready",
-                                    "severity": "info",
-                                    "payload": {"ready": True, "priority": auto_start_agents.index(agent_name) + 1, "mode": "adk"}
-                                })
-                            else:
-                                logger.warning(f"{adk_service_name} command rejected: {ack.get('error')}")
+                                logger.info(f"✅ {adk_service_name} responded to 'open' command")
                         except asyncio.TimeoutError:
-                            logger.error(f"Timeout sending command to {adk_service_name}")
+                            logger.error(f"Timeout sending 'open' to {adk_service_name}")
                         except Exception as e:
-                            logger.error(f"Error sending command to {adk_service_name}: {e}")
+                            logger.error(f"Error sending 'open' to {adk_service_name}: {e}")
+
+                        # Step 3: For Sentinel ADK, activate file monitoring in Core
+                        # The ADK doesn't do file watching, only the Core does
+                        if agent_name == "sentinel":
+                            await asyncio.sleep(1)
+                            try:
+                                # Determine if auto mode should be enabled
+                                is_auto = cerebro_config.auto_fix_enabled if cerebro_config else False
+
+                                monitor_ack = await asyncio.wait_for(
+                                    send_command(
+                                        core_service_name,
+                                        OrchestratorCommand(
+                                            action="monitor",
+                                            target=project_path,
+                                            options={"auto": is_auto}
+                                        )
+                                    ),
+                                    timeout=10.0
+                                )
+
+                                if monitor_ack.get("status") != "rejected":
+                                    self._projects.set_monitored(project_name)
+                                    logger.info(f"✅ Sentinel Core file monitoring activated for: {project_name}")
+                                else:
+                                    logger.warning(f"⚠️ Sentinel Core monitoring rejected: {monitor_ack.get('error')}")
+
+                            except asyncio.TimeoutError:
+                                logger.error(f"Timeout activating Sentinel Core monitoring")
+                            except Exception as e:
+                                logger.error(f"Error activating Sentinel Core monitoring: {e}")
+
+                        # Emit ADK ready event for all agents
+                        try:
+                            from app.sockets import emit_agent_event
+                            await emit_agent_event({
+                                "source": agent_name,
+                                "type": f"{agent_name}_adk_ready",
+                                "severity": "info",
+                                "payload": {"ready": True, "priority": auto_start_agents.index(agent_name) + 1, "mode": "adk"}
+                            })
+                        except Exception as e:
+                            logger.error(f"Error emitting ADK ready event: {e}")
 
                     else:
                         # Core mode only
@@ -291,10 +322,22 @@ class Orchestrator:
 
                         # Step 3: Send command to agent
                         try:
+                            # Determine if auto mode should be enabled
+                            # auto_fix_enabled=true → modo autónomo (no pregunta)
+                            # require_approval_critical=true → requiere aprobación para críticos
+                            is_auto = cerebro_config.auto_fix_enabled if cerebro_config else False
+
+                            # Para Sentinel, el comando monitor SIEMPRE va al Core (no al ADK)
+                            # El ADK no soporta file watching, solo el Core
+                            target_agent = "sentinel_core" if agent_name == "sentinel" else service_name
                             ack = await asyncio.wait_for(
                                 send_command(
-                                    service_name,
-                                    OrchestratorCommand(action="monitor" if agent_name == "sentinel" else "open", target=project_path)
+                                    target_agent,
+                                    OrchestratorCommand(
+                                        action="monitor" if agent_name == "sentinel" else "open",
+                                        target=project_path,
+                                        options={"auto": is_auto}
+                                    )
                                 ),
                                 timeout=10.0
                             )
@@ -313,6 +356,7 @@ class Orchestrator:
                                 })
                             else:
                                 logger.warning(f"{service_name} command rejected: {ack.get('error')}")
+
                         except asyncio.TimeoutError:
                             logger.error(f"Timeout sending command to {service_name}")
                         except Exception as e:

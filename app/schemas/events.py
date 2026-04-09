@@ -13,6 +13,14 @@ import logging
 logger = logging.getLogger("cerebro.schema")
 
 
+class Severity(str, Enum):
+    """Event severity levels."""
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+
 class EventValidationError(Exception):
     """Raised when an event fails schema validation."""
     pass
@@ -59,6 +67,7 @@ class BaseEvent(BaseModel):
     """Base fields for all events."""
     source: str = Field(..., description="Agent or system that emitted the event")
     type: str = Field(..., description="Event type")
+    severity: str = Field(default="info", description="Event severity (info, warning, error, critical)")
     timestamp: Optional[str] = Field(default=None, description="ISO timestamp")
     id: Optional[str] = Field(default=None, description="Unique event ID")
     payload: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Generic payload")

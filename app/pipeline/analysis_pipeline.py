@@ -29,6 +29,7 @@ class AnalysisPipeline:
         self.synthesizer = FindingSynthesizer()
         self._status: Optional[PipelineStatus] = None
         self._handlers: Dict[PipelineState, List[Callable]] = {}
+        self._on_state_change: Optional[Callable] = None
 
         # Circuit breaker for agent timeouts
         cb_config = CircuitBreakerConfig(
@@ -46,6 +47,10 @@ class AnalysisPipeline:
         # Pending agent completions (for async handling)
         self._pending_agent: Optional[str] = None
         self._agent_start_time: Optional[datetime] = None
+
+    def set_on_state_change(self, callback: Callable):
+        """Set callback for pipeline state changes."""
+        self._on_state_change = callback
 
     @property
     def status(self) -> Optional[PipelineStatus]:
@@ -166,6 +171,13 @@ class AnalysisPipeline:
                 handler(self._status)
             except Exception as e:
                 logger.error(f"State handler error: {e}")
+
+        # Notify state change callback
+        if self._on_state_change:
+            try:
+                self._on_state_change(old_state, new_state, self._status)
+            except Exception as e:
+                logger.error(f"State change callback error: {e}")
 
     def _run_synthesis(self) -> None:
         """Run synthesis and determine next step."""

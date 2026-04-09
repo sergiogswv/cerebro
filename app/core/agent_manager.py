@@ -361,9 +361,9 @@ class AgentManager:
             with open(config_path, "w", encoding="utf-8") as f:
                 toml.dump(config, f)
 
-            # Start monitoring
+            # Start monitoring - SIEMPRE al Core, no al ADK
             await send_command(
-                "sentinel",
+                "sentinel_core",
                 OrchestratorCommand(action="monitor", target=str(project_path))
             )
 

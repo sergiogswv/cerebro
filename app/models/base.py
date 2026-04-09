@@ -14,6 +14,7 @@ class AgentSource(str, Enum):
     architect = "architect"
     warden = "warden"
     ejecutor = "ejecutor"
+    executor = "executor"  # alias para compatibilidad con el Executor
 
 
 class Severity(str, Enum):

@@ -50,6 +50,7 @@ class AutofixClient:
 
         Args:
             event: Evento estandarizado del agente (con payload.file, payload.recommendation, etc.)
+                   Puede venir con un solo finding seleccionado por DecisionEngine
             batch_id: Identificador del batch nocturno
 
         Returns:
@@ -57,8 +58,97 @@ class AutofixClient:
         """
         payload = event.get("payload", {})
         target_file = payload.get("file") or payload.get("target") or event.get("target", "")
-        instruction   = payload.get("recommendation") or payload.get("summary", "Aplicar mejoras sugeridas")
-        project       = payload.get("target") or ""
+
+        # ── INSTRUCCIÓN PARA AIDER: UNA SOLA TAREA ──────────────────────────
+        # Estrategia de extracción en cascada (de más específico a más genérico)
+        instruction = None
+        source_field = None
+
+        # 1. Recommendation directa (prioridad máxima)
+        if payload.get("recommendation") and isinstance(payload["recommendation"], str):
+            rec = payload["recommendation"].strip()
+            if len(rec) > 10:  # Removido el filtro de "Revisar hallazgos..."
+                instruction = rec
+                source_field = "recommendation"
+                logger.debug(f"✓ Instrucción de recommendation ({len(instruction)} chars)")
+
+        # 2. Finding único estructurado
+        if not instruction:
+            findings = payload.get("findings", [])
+            if isinstance(findings, list) and len(findings) > 0 and isinstance(findings[0], dict):
+                finding = findings[0]
+                instruction = finding.get("suggestion") or finding.get("description")
+                if finding.get("file"):
+                    target_file = finding["file"]
+                if finding.get("line"):
+                    instruction = f"Línea {finding['line']}: {instruction}"
+                if instruction:
+                    source_field = "findings[0]"
+                    logger.debug(f"✓ Instrucción de findings[0] ({len(instruction)} chars)")
+
+        # 3. Análisis del LLM (texto completo)
+        if not instruction:
+            analysis = payload.get("analysis")
+            if isinstance(analysis, str) and len(analysis.strip()) > 20:
+                # Extraer primera oración o párrafo relevante
+                instruction = analysis.strip().split("\n\n")[0][:500]
+                source_field = "analysis"
+                logger.debug(f"✓ Instrucción de analysis ({len(instruction)} chars)")
+
+        # 4. Summary
+        if not instruction:
+            summary = payload.get("summary")
+            if isinstance(summary, str) and len(summary.strip()) > 10:
+                instruction = summary.strip()[:500]
+                source_field = "summary"
+                logger.debug(f"✓ Instrucción de summary ({len(instruction)} chars)")
+
+        # 5. Finding como string directo
+        if not instruction:
+            finding_str = payload.get("finding")
+            if isinstance(finding_str, str) and len(finding_str.strip()) > 10:
+                instruction = finding_str.strip()
+                source_field = "finding"
+                logger.debug(f"✓ Instrucción de finding ({len(instruction)} chars)")
+
+        # Fallback último
+        if not instruction:
+            instruction = "Aplicar mejora de código sugerida en el archivo"
+            source_field = "fallback"
+            logger.warning(f"⚠️ Usando instrucción genérica por falta de contenido")
+
+        project = payload.get("target") or ""
+
+        # Log detallado para debug
+        selected_info = ""
+        if payload.get("selected_from_batch"):
+            selected_info = f" [1/{payload.get('original_findings_count', '?')} seleccionado]"
+
+        # Log de qué campos hay disponibles en el payload
+        payload_keys = list(payload.keys())
+        logger.info(f"🔍 Payload keys: {payload_keys}")
+        logger.info(f"📝 Instrucción para Aider{selected_info} (source={source_field}): {instruction[:150]}...")
+
+        # DEBUG: Emitir evento al Dashboard con el detalle de la instrucción
+        await self._emit("autofix_instruction_debug", {
+            "autofix_id": autofix_id,
+            "target_file": target_file,
+            "instruction_source": source_field,
+            "instruction": instruction,
+            "payload_keys": payload_keys,
+            "selected_from_batch": payload.get("selected_from_batch", False),
+            "original_findings_count": payload.get("original_findings_count", None),
+            # Campos del payload que se usaron
+            "recommendation_preview": payload.get("recommendation", "")[:200] if payload.get("recommendation") else None,
+            "analysis_preview": payload.get("analysis", "")[:200] if payload.get("analysis") else None,
+            "finding_preview": payload.get("finding", "")[:200] if payload.get("finding") else None,
+            "summary_preview": payload.get("summary", "")[:200] if payload.get("summary") else None,
+        })
+
+        # DEBUG: Log completo del payload para la próxima ejecución (solo si instruction es fallback)
+        if source_field == "fallback":
+            logger.warning(f"⚠️ PAYLOAD COMPLETO para debug: {payload}")
+        # ─────────────────────────────────────────────────────────────────────
 
         # Inferir provider desde config de Cerebro (usa Ollama por defecto)
         from app.config import get_settings
@@ -94,6 +184,8 @@ class AutofixClient:
             # Resolver modelo: Priorizar config de Cerebro
             model = cerebro_cfg.auto_fix_model or "deepseek-coder-v2:16b-lite-instruct-q4_K_M"
             provider = cerebro_cfg.auto_fix_provider or "ollama"
+            base_url = cerebro_cfg.auto_fix_base_url
+            api_key = cerebro_cfg.auto_fix_api_key
 
             executor_result = await self._call_executor(
                 target_file=target_file,
@@ -102,6 +194,8 @@ class AutofixClient:
                 workspace_root=settings.workspace_root,
                 model=model,
                 provider=provider,
+                base_url=base_url,
+                api_key=api_key,
                 run_tests=val_cfg.get("run_tests", True),
                 require_build=val_cfg.get("require_build", True),
             )
@@ -187,6 +281,8 @@ class AutofixClient:
         workspace_root: str,
         model: str,
         provider: str,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
         run_tests: bool = True,
         require_build: bool = True,
     ) -> Dict[str, Any]:
@@ -202,6 +298,8 @@ class AutofixClient:
                 "workspace_root": workspace_root,
                 "provider": provider,
                 "model": model,
+                "base_url": base_url,
+                "api_key": api_key,
                 "cerebro_url": "http://localhost:4000",
                 "run_tests": run_tests,
                 "require_build": require_build,
@@ -247,6 +345,8 @@ class AutofixClient:
         cerebro_cfg = UnifiedConfigManager.get_instance().get_config().cerebro
         model = cerebro_cfg.auto_fix_model or "deepseek-coder-v2:16b-lite-instruct-q4_K_M"
         provider = cerebro_cfg.auto_fix_provider or "ollama"
+        base_url = cerebro_cfg.auto_fix_base_url
+        api_key = cerebro_cfg.auto_fix_api_key
 
         request_id = f"{action}-{uuid.uuid4().hex[:8]}"
         body = {
@@ -259,6 +359,8 @@ class AutofixClient:
                 "workspace_root": workspace_root,
                 "provider": provider,
                 "model": model,
+                "base_url": base_url,
+                "api_key": api_key,
                 "cerebro_url": "http://localhost:4000",
                 "context_files": context_files or [],
                 "run_tests": True, # Interactivo suele querer validación por defecto

@@ -17,10 +17,8 @@ htmlcov/
 
 # Variables de entorno (¡CRÍTICO!)
 .env
-.env.local
-.env.dev
-.env.prod
-*.env
+.env.*
+!.env.example
 
 # IDEs y Editores
 .vscode/

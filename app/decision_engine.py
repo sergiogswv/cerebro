@@ -635,24 +635,29 @@ class DecisionEngine:
         safe_types = autofix_rules.get("safe_issue_types", [])
 
         payload = event.get("payload", {})
-        
+
         # Intentar extraer confianza del análisis si viene anidada
         analysis = payload.get("analysis", {})
         confidence = payload.get("confidence", event.get("confidence", 0.0))
         if confidence == 0.0 and analysis:
             confidence = analysis.get("confidence", 0.0)
-            
+
         issue_type = payload.get("issue_type", "")
         if not issue_type and analysis:
             issue_type = analysis.get("issue_type", "")
 
-        # Si no hay issue_type pero hay hallazgos con fix sugerido, es propenso a autofix
+        # Si no hay issue_type pero hay hallazgos, es propenso a autofix
         findings = payload.get("findings", [])
         if not issue_type and findings:
-            has_fix = any(f.get("auto_fixable") or f.get("suggestion") for f in findings)
-            if has_fix:
-                issue_type = "code_finding" # Tipo genérico seguro
-                if confidence == 0.0: confidence = 0.85 # Asumir alta si hay sugerencias explícitas
+            if isinstance(findings, list):
+                has_fix = any(f.get("auto_fixable") or f.get("suggestion") for f in findings if isinstance(f, dict))
+                if has_fix:
+                    issue_type = "code_finding"
+                    if confidence == 0.0: confidence = 0.85
+            elif isinstance(findings, str) and len(findings.strip()) > 10:
+                # Si es un string (viene de Sentinel Rust), asumimos que es un hallazgo procesable
+                issue_type = "code_finding"
+                if confidence == 0.0: confidence = 0.85
 
         # Nunca autofix si está configurado para suprimir (aprendizaje previo)
         if payload.get("suppress_autofix") or event.get("suppress_autofix"):
@@ -670,3 +675,90 @@ class DecisionEngine:
             return True
 
         return False
+
+    def select_single_task(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Selecciona UNA SOLA tarea de una lista de findings/issues para enviar a Executor.
+
+        Prioriza por:
+        1. Severidad (critical > error > warning > info)
+        2. Confianza del análisis
+        3. Tipo de issue (safe types primero)
+
+        Args:
+            event: Evento con payload.findings (lista de issues) O payload.analysis (texto LLM)
+
+        Returns:
+            Dict con un solo finding seleccionado, o None si no hay findings
+        """
+        payload = event.get("payload", {})
+        findings = payload.get("findings", [])
+
+        # ── CASO 1: findings como lista estructurada ────────────────────────
+        if isinstance(findings, list) and len(findings) > 0 and all(isinstance(f, dict) for f in findings):
+            if len(findings) == 1:
+                # Solo un finding, retornar evento original
+                logger.debug(f"📋 Un solo finding en lista, usando evento original")
+                return event
+
+            # Múltiples findings: seleccionar uno por prioridad
+            severity_order = {"critical": 4, "error": 3, "warning": 2, "info": 1, "unknown": 0}
+            safe_types = self.rules.get("autofix_rules", {}).get("safe_issue_types", [])
+
+            def score_finding(f: Dict) -> int:
+                """Calcula score de prioridad para un finding."""
+                sev = f.get("severity", "unknown").lower()
+                sev_score = severity_order.get(sev, 0) * 40
+                issue_type = f.get("type", f.get("issue_type", ""))
+                safe_score = 30 if issue_type in safe_types else 0
+                conf = f.get("confidence", 0.5)
+                conf_score = int(conf * 30)
+                if f.get("auto_fixable") or f.get("suggestion"):
+                    return sev_score + safe_score + conf_score + 10
+                return sev_score + safe_score + conf_score
+
+            scored = [(f, score_finding(f)) for f in findings]
+            scored.sort(key=lambda x: -x[1])
+            selected_finding = scored[0][0]
+
+            logger.info(f"🎯 Seleccionando 1 tarea de {len(findings)} findings: {selected_finding.get('type', 'unknown')}")
+
+            modified_payload = payload.copy()
+            modified_payload["findings"] = [selected_finding]
+            modified_payload["selected_from_batch"] = True
+            modified_payload["original_findings_count"] = len(findings)
+            modified_payload["remaining_count"] = len(findings) - 1
+
+            if selected_finding.get("suggestion"):
+                modified_payload["recommendation"] = selected_finding["suggestion"]
+            if selected_finding.get("description"):
+                modified_payload["finding"] = selected_finding["description"]
+            if selected_finding.get("file"):
+                modified_payload["file"] = selected_finding["file"]
+
+            modified_event = event.copy()
+            modified_event["payload"] = modified_payload
+            return modified_event
+
+        # ── CASO 2: findings como string (texto del LLM) ─────────────────────
+        if isinstance(findings, str) and len(findings.strip()) > 20:
+            logger.debug(f"📋 Findings es string, usando evento original")
+            return event
+
+        # ── CASO 3: Sin findings lista, pero hay analysis/recommendation ─────
+        analysis = payload.get("analysis", "")
+        recommendation = payload.get("recommendation", "")
+
+        if isinstance(analysis, str) and len(analysis.strip()) > 20:
+            # El análisis del LLM ya es una "tarea única" sintetizada
+            logger.debug(f"📋 Usando analysis como tarea única ({len(analysis)} chars)")
+            return event
+
+        if isinstance(recommendation, str) and len(recommendation.strip()) > 20:
+            # La recomendación ya es una tarea sintetizada
+            logger.debug(f"📋 Usando recommendation como tarea única ({len(recommendation)} chars)")
+            return event
+
+        # ── CASO 4: No hay contenido procesable ──────────────────────────────
+        logger.warning(f"⚠️ No hay contenido procesable para autofix en evento {event.get('type', 'unknown')}")
+        return None

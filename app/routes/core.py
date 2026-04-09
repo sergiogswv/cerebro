@@ -50,10 +50,13 @@ async def receive_event(event: AgentEvent):
     """Endpoint principal. Los agentes envían sus eventos aquí."""
     try:
         logger.info(f"🔔 EVENTO [{event.source}] {event.type}: {event.payload}")
+        print(f"[DEBUG] Evento recibido: source={event.source}, type={event.type}, severity={event.severity}")
         result = await orchestrator.handle_event(event)
+        print(f"[DEBUG] Evento procesado: {result}")
         return ApiResponse(ok=True, message="evento procesado", data=result)
     except Exception as e:
         logger.exception("Error procesando evento")
+        print(f"[DEBUG] Error procesando evento: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -562,7 +565,7 @@ async def select_custom_project(request: Request):
 
                             await asyncio.sleep(2)  # Esperar a que ADK inicie
 
-                            # Step 2: Enviar comando al ADK
+                            # Step 2: Enviar comando "open" al ADK
                             from app.dispatcher import send_command
                             from app.models import OrchestratorCommand
 
@@ -575,6 +578,30 @@ async def select_custom_project(request: Request):
                                 logger.info(f"✅ {adk_service_name} respondió correctamente")
                             else:
                                 logger.warning(f"⚠️ {adk_service_name} no respondió: {ack.get('error')}")
+
+                            # Step 3: Para Sentinel ADK, activar monitoreo en el Core
+                            # El ADK no hace file watching, solo el Core lo hace
+                            if agent_name == "sentinel":
+                                await asyncio.sleep(1)
+                                logger.info(f"🛡️ Activando monitoreo de archivos en Sentinel Core...")
+                                try:
+                                    # Determinar modo auto: si NO requiere aprobación crítica, entonces auto=true
+                                    is_auto = not (cerebro_config.require_approval_critical if cerebro_config else True)
+                                    # Usar sentinel_core explícitamente para comando monitor
+                                    monitor_ack = await send_command(
+                                        "sentinel_core",
+                                        OrchestratorCommand(
+                                            action="monitor",
+                                            target=project_path,
+                                            options={"auto": is_auto}
+                                        )
+                                    )
+                                    if monitor_ack.get("status") == "ok":
+                                        logger.info(f"✅ Monitoreo de archivos activado en Sentinel Core (auto={is_auto})")
+                                    else:
+                                        logger.warning(f"⚠️ No se pudo activar monitoreo: {monitor_ack.get('error')}")
+                                except Exception as e:
+                                    logger.error(f"❌ Error activando monitoreo: {e}")
 
                         else:
                             # Core mode only

@@ -119,8 +119,13 @@ async def reject_change(request: Request):
     change_id = body.get("change_id")
     if not change_id:
         raise HTTPException(status_code=400, detail="change_id requerido")
-    if not await cm.reject_change(change_id):
+
+    # continue_pipeline: si True, Cerebro evalúa si continuar con Architect/Warden
+    continue_pipeline = body.get("continue_pipeline", False)
+
+    if not await cm.reject_change(change_id, continue_pipeline):
         raise HTTPException(status_code=404, detail="Cambio no encontrado")
+
     return ApiResponse(ok=True, message="Cambio rechazado")
 
 

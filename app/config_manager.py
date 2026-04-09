@@ -13,6 +13,13 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
+try:
+    import toml
+    TOML_AVAILABLE = True
+except ImportError:
+    TOML_AVAILABLE = False
+    toml = None
+
 from app.models.config import (
     AgentConfig,
     ArchitectConfig,
@@ -146,6 +153,7 @@ class UnifiedConfigManager:
         """Save configuration to JSON file.
 
         Serializes the current UnifiedConfig and writes it to disk.
+        Also syncs LLM configuration to Sentinel Core's .sentinelrc.toml
 
         Returns:
             True if save was successful, False otherwise
@@ -163,6 +171,10 @@ class UnifiedConfigManager:
                     indent=2,
                     ensure_ascii=False
                 )
+
+            # Sync to Sentinel Core config
+            self._sync_to_sentinel_config()
+
             return True
         except PermissionError as e:
             logging.error(f"Permission denied when saving config to {self._config_path}: {e}")
@@ -174,6 +186,190 @@ class UnifiedConfigManager:
             logging.error(f"Unexpected error when saving config to {self._config_path}: {e}")
 
         return False
+
+    def _sync_to_sentinel_config(self) -> None:
+        """Sync global LLM configuration to Sentinel Core's .sentinelrc.toml.
+
+        Updates the .sentinelrc.toml file in the active project's directory
+        with the global LLM configuration.
+        """
+        from pathlib import Path
+
+        if not TOML_AVAILABLE or self._config is None:
+            return
+
+        global_llm = self._config.global_config.get("llm")
+        if not global_llm:
+            return
+
+        # Get active project from cerebro config
+        cerebro_config = self._config.cerebro if hasattr(self._config, 'cerebro') else None
+        if not cerebro_config:
+            return
+
+        # Try to find project path from active_project
+        project_path = None
+        try:
+            from app.orchestrator import orchestrator
+            if orchestrator.active_project:
+                # Usar get_project_path para obtener la ruta correcta
+                project_path = orchestrator._projects.get_project_path(orchestrator.active_project)
+        except Exception:
+            pass
+
+        if not project_path:
+            return
+
+        sentinel_config_path = Path(project_path) / ".sentinelrc.toml"
+        if not sentinel_config_path.exists():
+            # No sentinel config to update
+            return
+
+        try:
+            # Read existing config
+            with open(sentinel_config_path, "r", encoding="utf-8") as f:
+                sentinel_config = toml.load(f)
+
+            # Map global LLM config to Sentinel format
+            provider = global_llm.get("provider", "anthropic")
+            model = global_llm.get("model", "claude-3-5-sonnet-20241022")
+            base_url = global_llm.get("base_url", "")
+            api_key = global_llm.get("api_key", "")
+
+            # Map provider names
+            sentinel_provider = provider
+            sentinel_url = base_url
+
+            if provider == "gemini-open-source":
+                sentinel_provider = "openai"  # Gemma uses OpenAI-compatible endpoint
+                # Ensure URL has /v1beta/openai/ path
+                if base_url and "generativelanguage.googleapis.com" in base_url:
+                    sentinel_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+            elif provider == "gemini":
+                sentinel_provider = "gemini"
+                sentinel_url = base_url or "https://generativelanguage.googleapis.com"
+            elif provider == "ollama":
+                sentinel_provider = "ollama"
+                sentinel_url = base_url or "http://localhost:11434"
+
+            # Update primary_model section
+            sentinel_config["primary_model"] = {
+                "name": model,
+                "url": sentinel_url,
+                "api_key": api_key,
+                "provider": sentinel_provider,
+            }
+
+            # Write back
+            with open(sentinel_config_path, "w", encoding="utf-8") as f:
+                toml.dump(sentinel_config, f)
+
+            logging.info(f"✅ Synced LLM config to Sentinel Core: {sentinel_config_path}")
+
+            # Also sync to Sentinel ADK .env file
+            self._sync_to_sentinel_adk_env(global_llm)
+
+        except Exception as e:
+            logging.warning(f"⚠️ Failed to sync config to Sentinel: {e}")
+
+    def _sync_to_sentinel_adk_env(self, global_llm: dict) -> None:
+        """Sync LLM configuration to Sentinel ADK's .env file.
+
+        Updates the .env file in sentinel_adk directory with the global LLM configuration.
+        """
+        from pathlib import Path
+
+        # Find sentinel_adk directory (sibling to cerebro directory)
+        cerebro_dir = Path(__file__).parent
+        sentinel_adk_dir = cerebro_dir.parent / "sentinel" / "sentinel_adk"
+
+        if not sentinel_adk_dir.exists():
+            logging.debug("Sentinel ADK directory not found, skipping .env sync")
+            return
+
+        env_path = sentinel_adk_dir / ".env"
+
+        # Read existing .env or create new
+        env_lines = []
+        env_vars = {}
+
+        if env_path.exists():
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.rstrip('\n')
+                    if '=' in line and not line.startswith('#'):
+                        key, val = line.split('=', 1)
+                        env_vars[key] = val
+                    env_lines.append(line)
+
+        # Map global LLM config to ADK env vars
+        provider = global_llm.get("provider", "gemini")
+        model = global_llm.get("model", "gemini-2.0-flash")
+        base_url = global_llm.get("base_url", "")
+        api_key = global_llm.get("api_key", "")
+
+        # Map provider
+        if provider == "gemini-open-source":
+            adk_provider = "gemini-open-source"
+            adk_model = model  # e.g., "gemma-4-31b-it"
+            adk_base_url = base_url or "https://generativelanguage.googleapis.com"
+        elif provider == "gemini":
+            adk_provider = "gemini"
+            adk_model = model
+            adk_base_url = base_url or "https://generativelanguage.googleapis.com"
+        elif provider == "ollama":
+            adk_provider = "ollama"
+            adk_model = model
+            adk_base_url = base_url or "http://localhost:11434"
+        elif provider == "claude":
+            adk_provider = "claude"
+            adk_model = model
+        elif provider == "openai":
+            adk_provider = "openai"
+            adk_model = model
+        else:
+            adk_provider = provider
+            adk_model = model
+            adk_base_url = base_url
+
+        # Update env vars
+        env_vars["LLM_PROVIDER"] = adk_provider
+        env_vars["GEMINI_MODEL"] = adk_model
+        if api_key:
+            if provider in ("gemini", "gemini-open-source"):
+                env_vars["GOOGLE_API_KEY"] = api_key
+            elif provider == "claude":
+                env_vars["ANTHROPIC_API_KEY"] = api_key
+            elif provider == "openai":
+                env_vars["OPENAI_API_KEY"] = api_key
+        if adk_base_url and provider in ("gemini", "gemini-open-source"):
+            env_vars["GOOGLE_API_BASE_URL"] = adk_base_url
+
+        # Rebuild .env content
+        new_lines = []
+        updated_keys = set()
+
+        for line in env_lines:
+            if '=' in line and not line.startswith('#'):
+                key = line.split('=', 1)[0]
+                if key in env_vars:
+                    new_lines.append(f"{key}={env_vars[key]}")
+                    updated_keys.add(key)
+                else:
+                    new_lines.append(line)
+            else:
+                new_lines.append(line)
+
+        # Add any new vars that weren't in the file
+        for key, val in env_vars.items():
+            if key not in updated_keys:
+                new_lines.append(f"{key}={val}")
+
+        # Write back
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.write('\n'.join(new_lines) + '\n')
+
+        logging.info(f"✅ Synced LLM config to Sentinel ADK: {env_path}")
 
     def reload(self) -> None:
         """Reload configuration from disk and clear cache.

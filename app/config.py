@@ -38,9 +38,9 @@ class Settings(BaseSettings):
     architect_adk_url: str = "http://127.0.0.1:4012"
 
     # Sentinel — modo de operación
-    # "core"  → llama directamente al Sentinel Core Rust (:4001)
-    # "adk"   → llama al sidecar Python con LLM + memoria (:4011)
-    sentinel_mode: str = "core"  # "core" | "adk"
+    # "core"  → llama directamente al Sentinel Core Rust (:4001) - Soporta monitoreo de archivos
+    # "adk"   → llama al sidecar Python con LLM + memoria (:4011) - Solo análisis bajo demanda
+    sentinel_mode: str = "core"  # "core" | "adk" — default "core" para monitoreo de archivos
     sentinel_adk_url: str = "http://127.0.0.1:4011"
 
     # LLM para el sidecar Warden ADK
@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     # Ollama para Warden
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3.2"
+
+    # Autofix / Aider Configuration
+    autofix_llm_provider: str = "gemini"  # ollama | openai | anthropic | gemini
+    autofix_llm_model: str = "gemma-4-31b-it"
+    autofix_api_key: str = ""
+    autofix_api_base: str = ""
 
     # Logging
     log_level: str = "INFO"

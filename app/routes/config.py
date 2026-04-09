@@ -67,7 +67,8 @@ def _sync_legacy_config_files(agent_name: str, llm_config: Any, project_path: Op
             logger.info(f"[Legacy Sync] Orchestrator active_project: {orchestrator.active_project}")
             logger.info(f"[Legacy Sync] Orchestrator workspace_root: {orchestrator.workspace_root}")
             if orchestrator.active_project:
-                project_path = os.path.join(orchestrator.workspace_root, orchestrator.active_project)
+                # Usar get_project_path para obtener la ruta correcta
+                project_path = orchestrator._projects.get_project_path(orchestrator.active_project)
                 logger.info(f"[Legacy Sync] Project path calculado: {project_path}")
             else:
                 _log_debug(f"[Legacy Sync] No hay proyecto activo en orchestrator")
@@ -104,6 +105,7 @@ def _sync_legacy_config_files(agent_name: str, llm_config: Any, project_path: Op
                 "ollama": "Ollama",
                 "openai": "OpenAI",
                 "gemini": "Gemini",
+                "gemini-open-source": "Gemini",  # Gemma es de Google/Gemini
                 "claude": "Claude"
             }
             legacy_provider = provider_mapping.get(llm_dict.get("provider", ""), "Ollama")
@@ -151,8 +153,16 @@ def _sync_legacy_config_files(agent_name: str, llm_config: Any, project_path: Op
                     _log_debug(f"[Legacy Sync] Creando nuevo archivo: {sentinel_path}")
 
                 # Actualizar sección [llm] con valores de global config
+                # Mapear provider para Sentinel Core: gemini-open-source usa endpoint OpenAI-compatible
+                provider = llm_dict.get("provider", "ollama")
+                if provider == "gemini-open-source":
+                    # Sentinel Core espera "openai" para endpoint OpenAI-compatible de Google
+                    sentinel_provider = "openai"
+                else:
+                    sentinel_provider = provider
+
                 config["llm"] = {
-                    "provider": llm_dict.get("provider", "ollama"),
+                    "provider": sentinel_provider,
                     "model": llm_dict.get("model", ""),
                     "base_url": llm_dict.get("base_url", ""),
                     "api_key": llm_dict.get("api_key", "")
@@ -165,6 +175,68 @@ def _sync_legacy_config_files(agent_name: str, llm_config: Any, project_path: Op
                 _log_debug(f"✅ Archivo legacy {action}: {sentinel_path}")
             except Exception as e:
                 _log_debug(f"No se pudo crear/actualizar {sentinel_path}: {e}")
+
+            # Also sync to Sentinel ADK .env file
+            try:
+                # Find sentinel_adk relative to cerebro directory (not project)
+                # Cerebro is at: skrymir-suite/cerebro/app/routes/config.py
+                # Sentinel ADK is at: skrymir-suite/sentinel/sentinel_adk
+                cerebro_dir = Path(__file__).parent.parent.parent  # cerebro/app/routes -> cerebro
+                sentinel_adk_dir = cerebro_dir.parent / "sentinel" / "sentinel_adk"
+                _log_debug(f"[Legacy Sync] Buscando Sentinel ADK en: {sentinel_adk_dir}")
+                if sentinel_adk_dir.exists():
+                    env_path = sentinel_adk_dir / ".env"
+                    if env_path.exists():
+                        # Read current .env
+                        env_content = env_path.read_text(encoding="utf-8")
+                        env_lines = env_content.split('\n')
+                        env_vars = {}
+                        for line in env_lines:
+                            if '=' in line and not line.startswith('#'):
+                                key, val = line.split('=', 1)
+                                env_vars[key] = val
+
+                        # Update LLM config
+                        provider = llm_dict.get("provider", "gemini")
+                        model = llm_dict.get("model", "gemini-2.0-flash")
+                        api_key = llm_dict.get("api_key", "")
+                        base_url = llm_dict.get("base_url", "")
+
+                        if provider == "gemini-open-source":
+                            env_vars["LLM_PROVIDER"] = "gemini-open-source"
+                            env_vars["GEMINI_MODEL"] = model
+                            if api_key:
+                                env_vars["GOOGLE_API_KEY"] = api_key
+                            if base_url:
+                                env_vars["GOOGLE_API_BASE_URL"] = base_url
+                        elif provider == "gemini":
+                            env_vars["LLM_PROVIDER"] = "gemini"
+                            env_vars["GEMINI_MODEL"] = model
+                            if api_key:
+                                env_vars["GOOGLE_API_KEY"] = api_key
+
+                        # Write back
+                        new_content = []
+                        updated = set()
+                        for line in env_lines:
+                            if '=' in line and not line.startswith('#'):
+                                key = line.split('=', 1)[0]
+                                if key in env_vars:
+                                    new_content.append(f"{key}={env_vars[key]}")
+                                    updated.add(key)
+                                else:
+                                    new_content.append(line)
+                            else:
+                                new_content.append(line)
+
+                        for key, val in env_vars.items():
+                            if key not in updated:
+                                new_content.append(f"{key}={val}")
+
+                        env_path.write_text('\n'.join(new_content), encoding="utf-8")
+                        _log_debug(f"✅ Sentinel ADK .env actualizado: {env_path}")
+            except Exception as e:
+                _log_debug(f"No se pudo actualizar Sentinel ADK .env: {e}")
 
     except Exception as e:
         _log_debug(f"Error sincronizando archivos legacy: {e}")
@@ -187,7 +259,7 @@ class UpdateGlobalConfigRequest(BaseModel):
 
 class UpdateLLMConfigRequest(BaseModel):
     """Request body for updating LLM configuration."""
-    provider: Literal["ollama", "openai", "gemini", "claude", "custom"] | None = None
+    provider: Literal["ollama", "openai", "gemini", "gemini-open-source", "claude", "custom"] | None = None
     model: str | None = None
     base_url: str | None = None
     api_key: str | None = None
@@ -360,6 +432,8 @@ async def get_cerebro_config():
                     "auto_fix_enabled": cerebro_config.auto_fix_enabled,
                     "auto_fix_provider": cerebro_config.auto_fix_provider,
                     "auto_fix_model": cerebro_config.auto_fix_model,
+                    "auto_fix_base_url": cerebro_config.auto_fix_base_url,
+                    "auto_fix_api_key": cerebro_config.auto_fix_api_key,
                     "isolation_branch_prefix": cerebro_config.isolation_branch_prefix,
                     "require_approval_critical": cerebro_config.require_approval_critical,
                     "notifier_timeout_mins": cerebro_config.notifier_timeout_mins,
@@ -378,6 +452,8 @@ async def get_cerebro_config():
                     "auto_fix_enabled": True,
                     "auto_fix_provider": "ollama",
                     "auto_fix_model": "qwen3:8b",
+                    "auto_fix_base_url": None,
+                    "auto_fix_api_key": None,
                     "isolation_branch_prefix": "skrymir-fix/",
                     "require_approval_critical": True,
                     "notifier_timeout_mins": 30,
@@ -438,6 +514,10 @@ async def update_cerebro_config(request: Request):
             cerebro_config.auto_fix_provider = new_config["auto_fix_provider"]
         if "auto_fix_model" in new_config:
             cerebro_config.auto_fix_model = new_config["auto_fix_model"]
+        if "auto_fix_base_url" in new_config:
+            cerebro_config.auto_fix_base_url = new_config["auto_fix_base_url"]
+        if "auto_fix_api_key" in new_config:
+            cerebro_config.auto_fix_api_key = new_config["auto_fix_api_key"]
         if "isolation_branch_prefix" in new_config:
             cerebro_config.isolation_branch_prefix = new_config["isolation_branch_prefix"]
         if "require_approval_critical" in new_config:
@@ -477,6 +557,8 @@ async def update_cerebro_config(request: Request):
                 "auto_fix_enabled": cerebro_config.auto_fix_enabled,
                 "auto_fix_provider": cerebro_config.auto_fix_provider,
                 "auto_fix_model": cerebro_config.auto_fix_model,
+                "auto_fix_base_url": cerebro_config.auto_fix_base_url,
+                "auto_fix_api_key": cerebro_config.auto_fix_api_key,
                 "isolation_branch_prefix": cerebro_config.isolation_branch_prefix,
                 "require_approval_critical": cerebro_config.require_approval_critical,
                 "notifier_timeout_mins": cerebro_config.notifier_timeout_mins,

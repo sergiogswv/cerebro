@@ -7,7 +7,7 @@ from datetime import datetime
 
 from app.pipeline.analysis_pipeline import AnalysisPipeline
 from app.pipeline.config_manager import PipelineConfigManager
-from app.pipeline.models import AgentFindings, AgentFinding
+from app.pipeline.models import AgentFindings, AgentFinding, PipelineState, PipelineStatus
 from app.sockets import emit_pipeline_event
 
 logger = logging.getLogger("cerebro.pipeline")
@@ -79,6 +79,9 @@ class PipelineCoordinator:
             return {"error": "No agents enabled in pipeline config"}
 
         try:
+            # Set up state change callback to trigger agent commands
+            self._pipeline.set_on_state_change(self._on_pipeline_state_change)
+
             status = self._pipeline.start(file_path, agents)
 
             await emit_pipeline_event("started", {
@@ -101,6 +104,121 @@ class PipelineCoordinator:
                 "error": str(e),
                 "current_state": self._pipeline.status.state.value if self._pipeline.status else None
             }
+
+    async def _on_pipeline_state_change(self, old_state: PipelineState, new_state: PipelineState, status: PipelineStatus):
+        """Handle pipeline state changes to trigger agent commands."""
+        from app.dispatcher import send_raw_command
+        from app.sockets import emit_agent_event
+
+        # Map states to agents
+        # Nota: Sentinel usa "sentinel_core" para comandos check (siempre al Core)
+        agent_map = {
+            PipelineState.ANALYZING_SENTINEL: "sentinel_core",  # Siempre al Core, no al ADK
+            PipelineState.ANALYZING_WARDEN: "warden",
+            PipelineState.ANALYZING_ARCHITECT: "architect",
+        }
+
+        agent = agent_map.get(new_state)
+        if not agent:
+            return  # Not an agent analysis state
+
+        # Para logging, mostrar el nombre base del agente
+        agent_name = "sentinel" if agent == "sentinel_core" else agent
+        logger.info(f"🔁 Pipeline state change: {old_state.value} → {new_state.value}, triggering {agent_name}")
+
+        # Emit pipeline_agent_started event
+        await emit_pipeline_event("agent_started", {
+            "pipeline_id": status.id,
+            "agent": agent_name,
+            "target_file": status.target_file,
+            "state": new_state.value,
+        })
+
+        # Send command to agent with auto_mode=true for automatic analysis
+        try:
+            command = {
+                "action": "check" if agent == "sentinel_core" else "analyze",
+                "target": status.target_file,
+                "options": {"auto": True},  # Enable auto_mode for LLM processing
+                "request_id": f"pipeline-{status.id[:8]}-{agent_name}"
+            }
+
+            ack = await send_raw_command(agent, command)
+            logger.info(f"📤 Pipeline triggered {agent}: {ack.get('status', 'unknown')}")
+
+            # For Sentinel, emit sentinel_check_completed event so DecisionEngine can evaluate AUTOFIX
+            if agent == "sentinel_core" and ack.get("status") == "ok":
+                result = ack.get("result", {})
+                raw = result.get("raw", {}).get("result", {})
+
+                # Extract findings from raw result (handles both issues[] and files[].issues[])
+                raw_findings = []
+                if isinstance(raw, dict):
+                    # Direct issues array
+                    raw_findings = raw.get("issues", [])
+                    # Or from files[].issues
+                    if not raw_findings and "files" in raw:
+                        for f in raw.get("files", []):
+                            raw_findings.extend(f.get("issues", []))
+
+                # Transform Sentinel Rust findings to DecisionEngine format
+                # Sentinel Rust: {file, rule, severity, message}
+                # DecisionEngine expects: {file, type/issue_type, severity, description, auto_fixable/suggestion}
+                findings = []
+                for f in raw_findings:
+                    if isinstance(f, dict):
+                        # Normalize rule/type to lowercase for safe_types matching
+                        rule = f.get("rule", f.get("type", "code_finding"))
+                        issue_type_normalized = rule.lower().replace("_", " ").replace("-", " ")
+                        # Map common rule types to safe_types
+                        type_mapping = {
+                            "dead code": "dead_code",
+                            "unused import": "unused_import",
+                            "unused variable": "unused_code",
+                            "formatting": "formatting",
+                            "style": "formatting",
+                            "complexity": "simple_refactor",
+                            "refactor": "simple_refactor",
+                        }
+                        mapped_type = type_mapping.get(issue_type_normalized, "code_finding")
+
+                        transformed = {
+                            "file": f.get("file", f.get("path", status.target_file)),
+                            "type": mapped_type,
+                            "issue_type": mapped_type,
+                            "severity": f.get("severity", "info").lower(),
+                            "description": f.get("message", f.get("description", "")),
+                            "suggestion": f.get("message", f.get("description", "")),  # Add suggestion for scoring
+                            "auto_fixable": True,  # Sentinel findings are auto-fixable by default
+                            "confidence": 0.85,
+                        }
+                        findings.append(transformed)
+
+                # Count issues
+                issues_count = len(findings)
+
+                # Determine if auto-fixable based on findings
+                auto_fixable = issues_count > 0 and any(
+                    f.get("severity") in ["critical", "error", "high", "medium"]
+                    for f in findings
+                )
+
+                await emit_agent_event({
+                    "source": "sentinel",
+                    "type": "sentinel_check_completed",
+                    "severity": "warning" if issues_count > 0 else "info",
+                    "payload": {
+                        "file": status.target_file,
+                        "summary": result.get("analysis", ""),
+                        "findings": findings,
+                        "auto_fixable": auto_fixable,
+                        "issues_count": issues_count,
+                        "confidence": 0.85  # Default confidence for pipeline-triggered analysis
+                    }
+                })
+                logger.info(f"📤 Emitted sentinel_check_completed for DecisionEngine (issues: {issues_count}, auto_fixable: {auto_fixable})")
+        except Exception as e:
+            logger.error(f"❌ Error triggering {agent} from pipeline: {e}")
 
     async def on_agent_complete(
         self,
