@@ -139,6 +139,17 @@ class EventRouter:
                     elapsed = now - lock_time
                     if elapsed < self._debounce_window:
                         logger.info(f"⏳ [Cerebro] Ignorando ANÁLISIS de {file_path} (Proyecto {locked_root} bloqueado: {elapsed:.1f}s restan)")
+                        await emit_agent_event({
+                            "source": "cerebro",
+                            "type": "decision",
+                            "severity": "info",
+                            "payload": {
+                                "action": "skip_analysis",
+                                "reason": "debounce",
+                                "file": file_path,
+                                "message": f"⏳ Análisis omitido por debounce ({elapsed:.1f}s desde el último cambio). El proyecto {locked_root} está bloqueado temporalmente.",
+                            }
+                        })
                         return {"action": "debounce_active", "status": "skipped"}
                     is_locked = True
                     break
@@ -264,6 +275,16 @@ class EventRouter:
             # Solo procesar si hay una tarea válida
             if not task_selected or not task_type:
                 logger.warning(f"⚠️ [Cerebro] Evento {event.type} ignorado para despacho: no contiene tarea válida. (task_selected={task_selected is not None}, task_type={task_type})")
+                await emit_agent_event({
+                    "source": "cerebro",
+                    "type": "decision",
+                    "severity": "warning",
+                    "payload": {
+                        "action": "ignore_event",
+                        "reason": "missing_task",
+                        "message": f"⚠️ Evento {event.type} de {event.source} ignorado: No se pudo extraer una tarea o tipo de acción válido.",
+                    }
+                })
                 return result
 
             if self._is_auto_mode_enabled():
@@ -495,6 +516,20 @@ class EventRouter:
             f"🧠 Decision: actions={[a.value for a in decision.actions]}, "
             f"reason={decision.reason}"
         )
+
+        # Emitir decisión al timeline
+        await emit_agent_event({
+            "source": "cerebro",
+            "type": "decision",
+            "severity": "info",
+            "payload": {
+                "actions": [a.value for a in decision.actions],
+                "reason": decision.reason,
+                "message": f"🧠 Cerebro decidió: {decision.reason} (Acciones: {', '.join([a.value for a in decision.actions]) or 'Ninguna'})",
+                "event_type": event.type,
+                "event_source": event.source
+            }
+        })
 
         # Record in ContextDB
         await self._record_event(event, decision)

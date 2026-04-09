@@ -59,8 +59,14 @@ class EventType(str, Enum):
     AGENT_READY = "agent_ready"
     AGENT_ADK_READY = "agent_adk_ready"
 
-    # Interaction
+    # Interaction events
     INTERACTION_REQUIRED = "interaction_required"
+    INTERACTION_RESOLVED = "interaction_resolved"
+
+    # Sentinel specific
+    FILE_CHANGE = "file_change"
+    SENTINEL_ANALYZE_ERROR = "sentinel_analyze_error"
+    SENTINEL_TASK_SELECTED = "sentinel_task_selected"
 
 
 class BaseEvent(BaseModel):

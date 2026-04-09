@@ -36,7 +36,7 @@ class AgentEvent(BaseModel):
     source: AgentSource
     type: str
     severity: Severity
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
