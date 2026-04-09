@@ -121,7 +121,9 @@ class EventRouter:
                 "payload": {
                     "original_event_id": event.id,
                     "file": file_path,
-                    "message": event.payload.get("message", f"Archivo modificado: {file_path}"),
+                    "agent_status": "eye_active",
+                    "short_file": file_path.replace("\\", "/").split("/")[-1],
+                    "message": event.payload.get("message", f"Sentinel detectó cambios en {file_path}. Iniciando inspección..."),
                 }
             })
 
