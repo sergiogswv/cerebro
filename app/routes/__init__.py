@@ -25,6 +25,7 @@ from .config    import router as config_router
 from .pipeline  import router as pipeline_router
 from .proactive import router as proactive_router
 from .interactive import router as interactive_router
+from .metrics   import router as metrics_router
 
 # Router principal — registra todos los sub-routers bajo el mismo prefijo /api
 router = APIRouter(prefix="/api", tags=["api"])
@@ -37,3 +38,4 @@ router.include_router(config_router)
 router.include_router(pipeline_router, prefix="/pipeline")
 router.include_router(proactive_router)  # /api/proactive/*
 router.include_router(interactive_router, prefix="/interactive")
+router.include_router(metrics_router)

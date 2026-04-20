@@ -45,6 +45,53 @@ async def get_status():
         return ApiResponse(ok=False, message=f"Error: {str(e)}", data={})
 
 
+@router.get("/status/full", response_model=ApiResponse, summary="Estado completo y de salud del sistema")
+async def get_full_status():
+    import asyncio
+    import httpx
+    
+    agents = ["sentinel_core", "sentinel_adk", "architect", "warden", "ejecutor"]
+    health = {}
+    from app.dispatcher import AGENT_URLS
+    
+    async def check_agent_health(agent_name):
+        url = AGENT_URLS.get(agent_name)
+        if not url:
+            return agent_name, {"status": "error", "error": "Not registered"}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                res = await client.get(f"{url}/health")
+                res.raise_for_status()
+                return agent_name, {"status": "ok", **res.json()}
+        except Exception as e:
+            return agent_name, {"status": "error", "error": str(e)}
+
+    results = await asyncio.gather(*(check_agent_health(a) for a in agents), return_exceptions=True)
+    for r in results:
+        if isinstance(r, tuple):
+            health[r[0]] = r[1]
+        else:
+            logger.error(f"Error checking health: {r}")
+
+    # Gather learning stats safely
+    learning_stats = {}
+    if hasattr(orchestrator, 'context_db') and orchestrator.context_db:
+        try:
+            learning_stats = orchestrator.context_db.get_feedback_stats()
+        except: pass
+
+    data = {
+        "cerebro": "ok",
+        "agents": health,
+        "active_project": getattr(orchestrator, 'active_project', None),
+        "active_locks": len(getattr(orchestrator._events, '_active_processing', {})),
+        "initializing_projects": list(getattr(orchestrator, '_initializing_projects', [])),
+        "learning_stats": learning_stats,
+    }
+
+    return ApiResponse(ok=True, message="Health check completo", data=data)
+
+
 @router.post("/events", response_model=ApiResponse, summary="Recibir evento de un agente")
 async def receive_event(event: AgentEvent):
     """Endpoint principal. Los agentes envían sus eventos aquí."""
@@ -118,6 +165,28 @@ async def select_project(request: Request):
     except Exception as e:
         logger.exception(f"[SelectProject] Error: {e}")
         return ApiResponse(ok=False, message=f"Error: {str(e)}", data={})
+
+
+@router.post("/projects/new", response_model=ApiResponse, summary="Crear un nuevo proyecto")
+async def create_project(request: Request):
+    try:
+        body = await request.json()
+        name = body.get("name")
+        project_type = body.get("project_type", "generic")
+        description = body.get("description", "")
+        base_path = body.get("base_path")
+        
+        if not name:
+            raise HTTPException(status_code=400, detail="name es requerido")
+
+        result = await orchestrator.create_project(name, project_type, description, base_path)
+        if result.get("status") == "error":
+            return ApiResponse(ok=False, message=result.get("message"))
+
+        return ApiResponse(ok=True, message="Proyecto creado", data=result)
+    except Exception as e:
+        logger.exception("Error creando proyecto")
+        return ApiResponse(ok=False, message=f"Error: {str(e)}")
 
 
 @router.post("/command/{agent}", response_model=ApiResponse, summary="Enviar comando a un agente")
@@ -489,6 +558,7 @@ async def select_custom_project(request: Request):
         settings = get_settings()
         object.__setattr__(settings, 'workspace_root', parent_dir)
         orchestrator._projects.workspace_root = parent_dir
+        orchestrator._agents.workspace_root = parent_dir
 
         # Establecer el proyecto activo (solo el nombre, sin iniciar agentes aún)
         # Usamos set_active en lugar de set_active_project para evitar iniciar sentinel inmediatamente
@@ -521,6 +591,22 @@ async def select_custom_project(request: Request):
                         is_adk_mode = agent_mode == "adk"
 
                         logger.info(f"Iniciando {agent_name} en modo {agent_mode} (prioridad: {auto_start_agents.index(agent_name) + 1})")
+
+                        if agent_name == "sentinel":
+                            sentinel_rc_path = Path(project_path) / ".sentinelrc.toml"
+                            if not sentinel_rc_path.exists():
+                                logger.info(f"🛡️ .sentinelrc.toml not found para {project_name}. Generando config headless AI primero...")
+                                try:
+                                    import toml
+                                    from app.orchestrator import orchestrator
+                                    config = await orchestrator._agents._generate_sentinel_config(
+                                        Path(project_path), False, "headless-custom"
+                                    )
+                                    with open(sentinel_rc_path, "w", encoding="utf-8") as f:
+                                        toml.dump(config, f)
+                                    logger.info("✅ Configuración headless de Sentinel generada.")
+                                except Exception as e:
+                                    logger.error(f"❌ Error generando config headless Sentinel: {e}")
 
                         if is_adk_mode:
                             # ADK mode: iniciar Core primero, luego ADK

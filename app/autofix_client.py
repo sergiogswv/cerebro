@@ -348,13 +348,35 @@ class AutofixClient:
         base_url = cerebro_cfg.auto_fix_base_url
         api_key = cerebro_cfg.auto_fix_api_key
 
+        # Obtener datos de contexto desde .sentinelrc.toml para enriquecer el prompt
+        project_context = ""
+        try:
+            sentinel_rc_path = os.path.join(workspace_root, ".sentinelrc.toml")
+            if os.path.exists(sentinel_rc_path):
+                import toml
+                with open(sentinel_rc_path, "r", encoding="utf-8") as f:
+                    config = toml.load(f)
+                    fw = config.get("project", {}).get("framework", "unknown")
+                    lang = config.get("project", {}).get("code_language", "unknown")
+                    rules = config.get("sentinel", {}).get("rules", [])
+                    
+                    if fw != "unknown" or lang != "unknown":
+                        project_context = f"\n\n--- INSTRUCCIONES DE CONTEXTO TÉCNICO ---\n"
+                        project_context += f"Framework del Proyecto: {fw}\n"
+                        project_context += f"Lenguaje de Programación: {lang}\n"
+                        if rules:
+                            project_context += f"Reglas Arquitecturales a seguir: {', '.join(rules)}\n"
+                        project_context += "Por favor adapta tu código exclusivamente a estas tecnologías y reglas."
+        except Exception as e:
+            logger.warning(f"No se pudo extraer contexto técnico de .sentinelrc.toml: {e}")
+
         request_id = f"{action}-{uuid.uuid4().hex[:8]}"
         body = {
             "action": action,
             "target": target_file,
             "request_id": request_id,
             "options": {
-                "instruction": instruction,
+                "instruction": f"{instruction}{project_context}",
                 "branch_prefix": f"skrymir-{action}/",
                 "workspace_root": workspace_root,
                 "provider": provider,

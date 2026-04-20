@@ -762,3 +762,125 @@ class DecisionEngine:
         # ── CASO 4: No hay contenido procesable ──────────────────────────────
         logger.warning(f"⚠️ No hay contenido procesable para autofix en evento {event.get('type', 'unknown')}")
         return None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # APRENDIZAJE ADAPTATIVO (TASK-04: Auto-aplicación de reglas)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def apply_learned_adjustments(
+        self,
+        rule_adjustments: List[Dict],
+        min_samples: int = 5,
+        min_consistency: float = 0.70,
+    ) -> Dict[str, Any]:
+        """
+        Aplica ajustes de reglas aprendidas al motor de decisiones en tiempo real.
+
+        Solo aplica reglas que superen los umbrales estadísticos:
+          - min_samples: mínimo de datapoints para tomar una decisión
+          - min_consistency: % mínimo de feedback en la misma dirección (0-1)
+
+        Args:
+            rule_adjustments: Lista de ajustes de `analyze_learning()['rule_adjustments']`
+            min_samples:       Mínimo de feedback para aplicar (defecto: 5)
+            min_consistency:   Mínimo de consistencia para aplicar (defecto: 0.70)
+
+        Returns:
+            Dict con stats de cuántas reglas se aplicaron, cuántas se saltaron.
+        """
+        applied = []
+        skipped = []
+
+        # Inicializar dict de umbrales por tipo de evento si no existe
+        if not hasattr(self, "_learned_thresholds"):
+            self._learned_thresholds: Dict[str, float] = {}
+
+        for adj in rule_adjustments:
+            sample_size  = adj.get("sample_size", 0)
+            consistency  = adj.get("consistency", 0.0)
+            event_type   = adj.get("event_type", "unknown")
+            direction    = adj.get("direction", "")
+            suggested    = adj.get("suggested_adjustment", {})
+
+            # Filtro estadístico: solo aplicar si hay suficientes datos y son consistentes
+            if sample_size < min_samples:
+                skipped.append({
+                    "id":     adj.get("id"),
+                    "reason": f"sample_size={sample_size} < min={min_samples}",
+                })
+                continue
+            if consistency < min_consistency:
+                skipped.append({
+                    "id":     adj.get("id"),
+                    "reason": f"consistency={consistency:.2f} < min={min_consistency:.2f}",
+                })
+                continue
+
+            # Aplicar el ajuste al umbral de confianza para este tipo de evento
+            threshold_key = f"confidence_threshold_for_{event_type}"
+            new_threshold = suggested.get("value", 0.8)
+            old_threshold = self._learned_thresholds.get(threshold_key,
+                self.rules.get("autofix_rules", {}).get("confidence_threshold", 0.8))
+
+            self._learned_thresholds[threshold_key] = new_threshold
+
+            # Persistir en ContextDB.learned_rules si está disponible
+            if self._context_db:
+                try:
+                    from datetime import datetime
+                    now = datetime.utcnow().isoformat()
+                    conn = self._context_db._get_connection()
+                    conn.execute(
+                        """
+                        INSERT INTO learned_rules
+                            (original_rule, adjusted_rule, reason, feedback_count, success_count, created_at, updated_at, active)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, TRUE)
+                        """,
+                        (
+                            f"{threshold_key}={old_threshold:.3f}",
+                            f"{threshold_key}={new_threshold:.3f}",
+                            f"Auto-aplicado: {direction} | consistency={consistency:.2f} | n={sample_size}",
+                            sample_size,
+                            0,
+                            now,
+                            now,
+                        ),
+                    )
+                    conn.commit()
+                except Exception as pe:
+                    logger.warning(f"⚠️ No se pudo persistir regla aprendida: {pe}")
+
+            applied.append({
+                "id":          adj.get("id"),
+                "event_type":  event_type,
+                "direction":   direction,
+                "old_value":   old_threshold,
+                "new_value":   new_threshold,
+                "consistency": consistency,
+                "sample_size": sample_size,
+            })
+            logger.info(
+                f"🧠 Regla aprendida aplicada: {threshold_key} "
+                f"{old_threshold:.2f} → {new_threshold:.2f} "
+                f"(n={sample_size}, c={consistency:.2f})"
+            )
+
+        return {
+            "applied_count":  len(applied),
+            "skipped_count":  len(skipped),
+            "applied":        applied,
+            "skipped":        skipped,
+        }
+
+    def get_effective_threshold(self, event_type: str) -> float:
+        """
+        Retorna el umbral de confianza efectivo para un tipo de evento.
+        Primero consulta los umbrales aprendidos; si no hay, usa el default.
+        """
+        learned = getattr(self, "_learned_thresholds", {})
+        key = f"confidence_threshold_for_{event_type}"
+        return learned.get(key, self.rules.get("autofix_rules", {}).get("confidence_threshold", 0.8))
+
+    def get_learned_thresholds(self) -> Dict[str, float]:
+        """Retorna todos los umbrales aprendidos activos (para el dashboard)."""
+        return dict(getattr(self, "_learned_thresholds", {}))

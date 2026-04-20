@@ -8,6 +8,9 @@ from pathlib import Path
 from app.sockets import emit_system_status
 from app.dispatcher import notify
 
+import shutil
+import subprocess
+
 logger = logging.getLogger("cerebro.project")
 
 
@@ -98,6 +101,16 @@ class ProjectManager:
         self._active_project = project
         logger.info(f"📁 Active project set: {project}")
 
+        # Persist state
+        from app.context_db import get_context_db
+        db = get_context_db()
+        # Mark others as idle, this one as active
+        active_projects = db.get_projects_by_state('active')
+        for p in active_projects:
+            if p != project:
+                db.set_project_state(p, 'idle')
+        db.set_project_state(project, 'active')
+
         # Notify dashboard
         await emit_system_status({
             "type": "project_selected",
@@ -112,6 +125,53 @@ class ProjectManager:
                 logger.error(f"Activation callback error: {e}")
 
         return {"status": "ok", "project": project, "restarted": True}
+
+    async def create_project(self, name: str, project_type: str = "generic", description: str = "", base_path: Optional[str] = None) -> Dict:
+        """Create a new project directory in workspace root or custom path."""
+        if not name:
+            return {"status": "error", "message": "Nombre del proyecto es requerido"}
+
+        # Sanitizar nombre
+        name = "".join(c for c in name if c.isalnum() or c in ("-", "_")).strip()
+        
+        # Determinar directorio padre
+        parent_dir = base_path or self.workspace_root
+        parent_dir = os.path.expanduser(parent_dir)
+        parent_dir = os.path.abspath(parent_dir)
+        
+        path = os.path.join(parent_dir, name)
+
+        if os.path.exists(path):
+            return {"status": "error", "message": f"El proyecto '{name}' ya existe en esa ubicación"}
+
+        try:
+            os.makedirs(path, exist_ok=True)
+            
+            # Inicializar con un README mínimo que incluya la descripción
+            readme_path = os.path.join(path, "README.md")
+            with open(readme_path, "w", encoding="utf-8") as f:
+                f.write(f"# {name}\n\n{description or 'Proyecto creado desde Skrymir Suite.'}\n")
+                if project_type != "generic":
+                    f.write(f"\nTipo de proyecto: {project_type}\n")
+
+            logger.info(f"✨ Proyecto nuevo creado: {name} en {path} (Tipo: {project_type})")
+
+            # Opcional: git init si está disponible
+            try:
+                subprocess.run(["git", "init"], cwd=path, capture_output=True)
+            except:
+                pass
+
+            return {
+                "status": "ok", 
+                "project": name, 
+                "path": path.replace("\\", "/"),
+                "project_type": project_type,
+                "description": description
+            }
+        except Exception as e:
+            logger.error(f"Error creando proyecto: {e}")
+            return {"status": "error", "message": str(e)}
 
     def get_project_path(self, project: Optional[str] = None) -> str:
         """Get full path to project directory."""

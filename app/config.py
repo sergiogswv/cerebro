@@ -3,6 +3,20 @@ from functools import lru_cache
 from pathlib import Path
 import platform
 import os
+from enum import Enum
+
+class SentinelMode(str, Enum):
+    CORE_ONLY = "core_only"    # Solo análisis estático Rust (sin LLM)
+    ADK_ONLY  = "adk_only"     # Solo análisis LLM via ADK
+    HYBRID    = "hybrid"       # Core detecta, ADK analiza (modo actual pero con intención)
+
+class ArchitectMode(str, Enum):
+    CORE = "core"  # Directamente al Architect Core Rust (:4002)
+    ADK  = "adk"   # Sidecar Python con LLM + memoria (:4012)
+
+class WardenMode(str, Enum):
+    CORE = "core"  # Directamente al Warden Core Rust (:4003)
+    ADK  = "adk"   # Sidecar Python con LLM + memoria (:4013)
 
 # Detectar ruta base dinámicamente según la ubicación de este archivo
 # __file__ -> cerebro/app/config.py
@@ -26,21 +40,18 @@ class Settings(BaseSettings):
     notifier_url: str = "http://127.0.0.1:4100"
 
     # Warden — modo de operación
-    # "core"  → llama directamente al Warden Core Rust (:4003)
-    # "adk"   → llama al sidecar Python con LLM + memoria (:4013)
-    warden_mode: str = "core"  # "core" | "adk"
+    warden_mode: str = WardenMode.CORE.value
     warden_adk_url: str = "http://127.0.0.1:4013"
 
     # Architect — modo de operación
-    # "core"  → llama directamente al Architect Core Rust (:4002)
-    # "adk"   → llama al sidecar Python con LLM + memoria (:4012)
-    architect_mode: str = "core"  # "core" | "adk"
+    architect_mode: str = ArchitectMode.CORE.value
     architect_adk_url: str = "http://127.0.0.1:4012"
 
     # Sentinel — modo de operación
-    # "core"  → llama directamente al Sentinel Core Rust (:4001) - Soporta monitoreo de archivos
-    # "adk"   → llama al sidecar Python con LLM + memoria (:4011) - Solo análisis bajo demanda
-    sentinel_mode: str = "core"  # "core" | "adk" — default "core" para monitoreo de archivos
+    # "core_only"  → Solo análisis estático Rust (sin LLM)
+    # "adk_only"   → Solo análisis LLM via ADK
+    # "hybrid"     → Core Rust detecta cambios, ADK python los analiza con LLM
+    sentinel_mode: str = SentinelMode.HYBRID.value
     sentinel_adk_url: str = "http://127.0.0.1:4011"
 
     # LLM para el sidecar Warden ADK

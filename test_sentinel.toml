@@ -1,0 +1,25 @@
+version = "5.0.0"
+project_name = "nest-2"
+framework = "nest"
+manager = "npm"
+test_command = "npm run test"
+architecture_rules = []
+file_extensions = [ "ts", "js", "jsx", "tsx", "py", "go",]
+code_language = "typescript"
+parent_patterns = [ ".service.ts", ".controller.ts", ".repository.ts",]
+test_patterns = [ "test/{name}/{name}.spec.ts",]
+ignore_patterns = [ "node_modules", "dist", ".git", "build", ".next", "target", "vendor", "__pycache__", ".sentinel", ".sentinel_stats.json", ".sentinelrc.toml",]
+use_cache = true
+auto_mode = false
+
+[primary_model]
+name = "llama"
+url = "http"
+api_key = "123"
+provider = "ollama"
+
+[rule_config]
+complexity_threshold = 10
+function_length_threshold = 60
+dead_code_enabled = true
+unused_imports_enabled = true

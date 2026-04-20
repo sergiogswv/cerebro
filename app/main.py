@@ -73,7 +73,26 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.warning(f"⚠️  ProactiveScheduler no pudo iniciar: {exc}")
 
+    # ── Mensaje de Bienvenida por Voz ─────────────────────────────────────────
+    async def delayed_voice_welcome():
+        await asyncio.sleep(3)  # Más rápido para no desesperar al usuario
+        try:
+            from app.agents.voice_agent import voice_agent
+            await voice_agent.generate_welcome()
+        except Exception as exc:
+            logger.warning(f"🎙️  VoiceAgent no pudo dar la bienvenida: {exc}")
+
     asyncio.create_task(delayed_proactive_start())
+    asyncio.create_task(delayed_voice_welcome())
+
+    # ── TASK-03: Cleanup de locks huérfanos ──────────────────────────────────
+    async def start_stale_lock_cleanup():
+        await asyncio.sleep(10)  # Esperar arranque inicial
+        from app.orchestrator import orchestrator
+        await orchestrator._events.start_stale_lock_cleanup()
+
+    asyncio.create_task(start_stale_lock_cleanup())
+    logger.info("🧹 Stale lock cleanup task programada")
 
     yield
     # ── Apagar scheduler al cerrar ────────────────────────────────────────────

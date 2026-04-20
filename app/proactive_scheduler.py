@@ -236,6 +236,11 @@ class ProactiveScheduler:
             t = asyncio.create_task(self._loop("new_implementation", interval))
             self._tasks.append(t)
 
+        # TASK-04: Loop de auto-aplicación de reglas aprendidas (cada 24h)
+        t = asyncio.create_task(self._learning_apply_loop())
+        self._tasks.append(t)
+        logger.info("🧪 Learning apply loop programado (cada 24h)")
+
     async def stop(self):
         """Detiene todos los loops."""
         self._running = False
@@ -272,6 +277,80 @@ class ProactiveScheduler:
                 except Exception as exc:
                     logger.error(f"❌ Error en loop {mode}: {exc}")
             await asyncio.sleep(interval_seconds)
+
+    async def _learning_apply_loop(self):
+        """
+        TASK-04: Loop de aprendizaje autónomo.
+        Cada 24h analiza el feedback acumulado y aplica ajustes al DecisionEngine.
+        Primera ejecución: 1 hora después del arranque (para acumular datos).
+        """
+        logger.info("🧠 Learning apply loop iniciado")
+        await asyncio.sleep(3600)  # Primera ejecución: 1h después del arranque
+
+        while self._running:
+            try:
+                await self._apply_learning_cycle()
+            except Exception as exc:
+                logger.error(f"❌ Error en learning apply loop: {exc}")
+            await asyncio.sleep(86400)  # Luego, cada 24 horas
+
+    async def _apply_learning_cycle(self):
+        """
+        Ejecuta un ciclo completo de análisis y auto-aplicación de reglas.
+        Puede llamarse manualmente vía trigger.
+        """
+        from app.context_db import get_context_db
+        from app.orchestrator import orchestrator
+
+        logger.info("🧠 [LearningCycle] Iniciando análisis de feedback acumulado...")
+
+        db = get_context_db()
+        analysis = db.analyze_learning(limit=500)  # Analizar hasta 500 feedbacks
+
+        total_feedback = analysis.get("total_feedback", 0)
+        rule_adjustments = analysis.get("rule_adjustments", [])
+
+        if total_feedback == 0:
+            logger.info("🧠 [LearningCycle] Sin feedback acumulado aún. Saltando.")
+            return
+
+        if not rule_adjustments:
+            logger.info("🧠 [LearningCycle] Feedback insuficiente para generar ajustes.")
+            return
+
+        logger.info(
+            f"🧠 [LearningCycle] {total_feedback} feedbacks analizados. "
+            f"{len(rule_adjustments)} ajustes candidatos."
+        )
+
+        # Aplicar ajustes al DecisionEngine
+        result = orchestrator.decision_engine.apply_learned_adjustments(
+            rule_adjustments,
+            min_samples=5,
+            min_consistency=0.70,
+        )
+
+        # Emitir evento al dashboard
+        await self._emit_event("learning_cycle_completed", {
+            "total_feedback":   total_feedback,
+            "candidates":       len(rule_adjustments),
+            "applied_count":    result["applied_count"],
+            "skipped_count":    result["skipped_count"],
+            "applied":          result["applied"],
+            "message":          (
+                f"🧠 Ciclo de aprendizaje: {result['applied_count']} reglas aplicadas, "
+                f"{result['skipped_count']} sin suficientes datos."
+            ),
+        })
+
+        if result["applied_count"] > 0:
+            logger.info(
+                f"✅ [LearningCycle] {result['applied_count']} reglas aprendidas aplicadas "
+                f"al DecisionEngine. Umbrales actualizados: "
+                f"{orchestrator.decision_engine.get_learned_thresholds()}"
+            )
+        else:
+            logger.info("🧠 [LearningCycle] Ningun ajuste pasó los umbrales estadísticos.")
 
     async def _run_mode(self, mode: str):
         """Ejecuta un ciclo de análisis para el modo dado."""

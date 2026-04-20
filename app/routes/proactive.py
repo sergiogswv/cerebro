@@ -173,7 +173,14 @@ async def get_night_summary(project: str = None):
             else:
                 summary["analyzed"] += cnt
 
-        has_activity = any(v > 0 for v in summary.values())
+        has_activity = summary["autofixes_applied"] > 0 or summary["pending_review"] > 0
+
+        # Si el proyecto es 'default' (no seleccionado) y no hay nada real, no molestar
+        if target_project == "default" and not has_activity:
+            return ApiResponse(ok=True, message="Sin actividad relevante", data={
+                "has_activity": False,
+                "night_mode_active": scheduler.is_night_mode_active()
+            })
 
         return ApiResponse(ok=True, message="Resumen nocturno", data={
             "project": target_project,

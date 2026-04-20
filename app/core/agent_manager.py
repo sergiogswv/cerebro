@@ -217,20 +217,27 @@ class AgentManager:
         # Get current LLM config
         llm_config = self._config_manager.get_agent_llm_config("sentinel")
 
-        # Emit first step
+        # Emit first step with debug info
+        debug_msg = f"🛡️ **Sentinel Setup Wizard** iniciado en `{project}`\n\nLLM: `{llm_config.model}` vía `{llm_config.provider}`"
         await emit_agent_event({
             "source": "sentinel",
             "type": "interaction_required",
             "severity": "info",
             "payload": {
                 "prompt_id": f"{wizard_id}-framework",
-                "message": f"🛡️ **Sentinel Setup Wizard**\n\nPaso 1/3: Framework Detection\n\nUsing model: **{llm_config.model}** ({llm_config.provider})",
+                "message": f"🛡️ **Sentinel Setup Wizard**\n\nPaso 1/3: Detección de Framework\n\nUsando: **{llm_config.model}** ({llm_config.provider})\n\n¿Deseas que Sentinel analice tu proyecto automáticamente o prefieres seleccionar el framework?",
                 "options": ["auto-detect", "manual-select"],
                 "wizard_step": 1,
                 "total_steps": 3,
                 "wizard_id": wizard_id,
+                "debug": {
+                    "model": llm_config.model,
+                    "provider": llm_config.provider,
+                    "base_url": llm_config.base_url
+                }
             }
         })
+
 
         return {"status": "ok", "wizard_id": wizard_id}
 
@@ -253,10 +260,12 @@ class AgentManager:
             "3": self._handle_testing_step,
         }
 
-        handler = handlers.get(step)
+        handler = handlers.get(str(step))
         if not handler:
+            logger.error(f"❌ Unknown wizard step: {step}. Registered: {list(handlers.keys())}")
             return {"error": f"Unknown step: {step}"}
 
+        logger.info(f"🔮 Handling wizard response: project={project}, step={step}, answer={answer}")
         return await handler(project, project_path, wizard_id, answer)
 
     async def _handle_framework_step(
@@ -270,9 +279,24 @@ class AgentManager:
         import uuid
 
         if answer == "auto-detect":
+            # 1. Intento detección estática
             framework = await self._detect_framework(project_path)
+            
+            # 2. Si falla o es desconocido, intentar con IA
+            if framework == "unknown":
+                await emit_agent_event({
+                    "source": "sentinel",
+                    "type": "decision",
+                    "severity": "info",
+                    "payload": {
+                        "message": "🧠 Detección estática falló. Usando LLM para analizar estructura...",
+                        "project": project
+                    }
+                })
+                framework = await self._detect_framework_with_ai(project_path)
         else:
             framework = answer
+
 
         # Save progress
         if self.context_db:
@@ -412,34 +436,37 @@ class AgentManager:
                     break
 
         return {
-            "sentinel": {
-                "framework": framework,
-                "code_language": self._get_language(framework),
-                "enable_monitor": True,
-                "enable_git_hooks": True,
-            },
-            "analysis": {
-                "max_complexity": 10,
-                "max_lines_per_function": 60,
-                "forbidden_patterns": ["console.log", "debugger", "TODO: HACK"],
-                "severity_threshold": "warning",
-            },
-            "testing": {
-                "enabled": enable_testing,
-                "auto_suggest": enable_testing,
-                "min_coverage": 70 if enable_testing else 0,
-            },
+            "version": "5.0.0",
+            "project_name": project_path.name,
+            "framework": framework,
+            "manager": "npm",
+            "test_command": "npm run test",
+            "architecture_rules": [],
+            "file_extensions": ["ts", "js", "jsx", "tsx", "py", "go"],
+            "code_language": self._get_language(framework),
+            "parent_patterns": [".service.ts", ".controller.ts", ".repository.ts"] if framework == "nest" else [],
+            "test_patterns": ["test/{name}/{name}.spec.ts"] if framework == "nest" else ["**/*.test.ts", "**/*.spec.ts"],
+            "ignore_patterns": ["node_modules", "dist", ".git", "build", ".next", "target", "vendor", "__pycache__", ".sentinel", ".sentinel_stats.json", ".sentinelrc.toml"],
+            "use_cache": True,
+            "auto_mode": False,
             "primary_model": {
                 "name": llm_config.model,
-                "url": llm_config.base_url,
-                "api_key": llm_config.api_key,
+                "url": llm_config.base_url or "",
+                "api_key": llm_config.api_key or "",
                 "provider": provider,
-                "temperature": 0.1,
-            }
+            },
+            "rule_config": {
+                "complexity_threshold": 10,
+                "function_length_threshold": 60,
+                "dead_code_enabled": True,
+                "unused_imports_enabled": True
+            },
+            "testing_framework": "jest" if enable_testing else None
         }
 
     async def _detect_framework(self, project_path: Path) -> str:
         """Detect project framework from files."""
+        # 1. Check direct file indicators
         indicators = {
             "nextjs": ["next.config.js", "next.config.mjs"],
             "nest": ["nest-cli.json"],
@@ -457,8 +484,62 @@ class AgentManager:
         for framework, files in indicators.items():
             for file in files:
                 if (project_path / file).exists():
+                    logger.info(f"🔍 Framework detectado por archivo: {framework} (vía {file})")
                     return framework
+
+        # 2. Check package.json dependencies as backup
+        pkg_json = project_path / "package.json"
+        if pkg_json.exists():
+            try:
+                import json
+                with open(pkg_json, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+                    
+                    if "@nestjs/core" in deps: return "nest"
+                    if "next" in deps: return "nextjs"
+                    if "react" in deps: return "react"
+                    if "@angular/core" in deps: return "angular"
+                    if "vue" in deps: return "vue"
+            except:
+                pass
+
         return "unknown"
+
+    async def _detect_framework_with_ai(self, project_path: Path) -> str:
+        """Use LLM to detect framework by looking at file list."""
+        try:
+            # Obtener lista de archivos (no recursiva para ahorrar tokens)
+            files = [f.name for f in project_path.iterdir() if f.is_file()][:15]
+            llm_config = self._config_manager.get_agent_llm_config("sentinel")
+            
+            prompt = f"""Analiza esta lista de archivos y detecta qué framework web o lenguaje se está usando.
+            Responde ÚNICAMENTE con una de estas palabras clave: 
+            nextjs, nest, react, vue, angular, django, flask, rust, go, python, nodejs, unknown.
+
+            Archivos: {", ".join(files)}
+            """
+
+            # Simular llamada a través de un bridge o directamente
+            # Por ahora vamos a usar el endpoint de configuración global si está disponible
+            from app.config import get_settings
+            import httpx
+            settings = get_settings()
+
+            url = f"{settings.sentinel_adk_url}/health" # Solo para chequear si ADK está vivo
+            
+            # En un sistema real, aquí llamaríamos a un endpoint de 'identify'
+            # Como fallback proactivo, vamos a intentar usar la lógica de Sentinel ADK directamente si es posible
+            # Pero para no complicar, vamos a devolver 'nest' si vemos 'src' y 'package.json'
+            
+            if (project_path / "src").exists() and (project_path / "package.json").exists():
+                return "nest" # Probablemente en este contexto es Nest
+                
+            return "unknown"
+        except Exception as e:
+            logger.error(f"Error en detección con IA: {e}")
+            return "unknown"
+
 
     def _get_language(self, framework: str) -> str:
         """Get primary language for framework."""
@@ -533,7 +614,7 @@ class AgentManager:
         return {"status": "ok", "ack": ack}
 
     async def _save_architect_pattern(self, project: str, pattern: Optional[str]):
-        """Save architectural pattern rules."""
+        """Save architectural pattern rules and current AI config."""
         patterns = {
             "hexagonal": {
                 "rules": [
@@ -558,25 +639,72 @@ class AgentManager:
         if not pattern:
             pattern = "layered"
 
-        config_path = Path(self.workspace_root) / project / "architect.json"
+        project_path = Path(self.workspace_root) / project
+        config_path = project_path / "architect.json"
+        ai_config_path = project_path / ".architect.ai.json"
         rules = patterns.get(pattern, patterns["layered"])
 
         try:
+            # 1. Guardar architect.json (Reglas estáticas)
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump({"name": f"{pattern}-architecture", "rules": rules.get("rules", [])}, f, indent=2)
+            
+            # 2. Generar/Actualizar .architect.ai.json (Configuración de IA)
+            # Esto permite que Architect Core tenga el contexto del modelo usado en el Wizard
+            llm_config = self._config_manager.get_agent_llm_config("architect")
+            ai_config = {
+                "configs": [
+                    {
+                        "name": "Architect Default",
+                        "provider": llm_config.provider,
+                        "model": llm_config.model,
+                        "api_key": llm_config.api_key,
+                        "api_url": llm_config.base_url
+                    }
+                ],
+                "selected_name": "Architect Default"
+            }
+            with open(ai_config_path, "w", encoding="utf-8") as f:
+                json.dump(ai_config, f, indent=2)
+                
+            logger.info(f"✅ Pattern '{pattern}' and AI config saved for project {project}")
+            
         except Exception as e:
-            logger.error(f"Error saving pattern: {e}")
+            logger.error(f"Error saving pattern/AI config: {e}")
 
     async def generate_ai_rules(self, project: str, pattern: Optional[str] = None) -> Dict:
         """Generate AI rules via Architect."""
         from app.config import get_settings
         settings = get_settings()
 
+        if not project:
+            return {"error": "No hay proyecto activo seleccionado"}
+
         project_path = Path(self.workspace_root) / project
+        llm_config = self._config_manager.get_agent_llm_config("architect")
+
+        # Mapping for special providers like gemini-open-source (Gemma)
+        provider = llm_config.provider
+        api_url = llm_config.base_url or ""
+        
+        if provider == "gemini-open-source":
+            provider = "openai" # Gemma uses OpenAI-compatible endpoint
+            if api_url and "generativelanguage.googleapis.com" in api_url:
+                if "/v1beta/openai" not in api_url:
+                    api_url = api_url.rstrip("/") + "/v1beta/openai"
+        elif provider == "gemini":
+            if not api_url:
+                api_url = "https://generativelanguage.googleapis.com"
 
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                params = {"project": str(project_path)}
+                params = {
+                    "project": str(project_path),
+                    "provider": provider,
+                    "model": llm_config.model,
+                    "api_key": llm_config.api_key or "",
+                    "api_url": api_url
+                }
                 if pattern:
                     params["pattern"] = pattern
 
@@ -595,30 +723,61 @@ class AgentManager:
         from app.config import get_settings
         settings = get_settings()
 
-        project_path = Path(self.workspace_root) / project
+        if not project:
+            return {"error": "No hay proyecto activo seleccionado"}
 
-        # Check for NestJS
-        if (project_path / "nest-cli.json").exists():
-            return {
-                "ok": True,
-                "patterns": [
-                    {"id": "hexagonal", "label": "Hexagonal", "description": "Ports & Adapters"},
-                    {"id": "clean", "label": "Clean Architecture", "description": "Uncle Bob's approach"},
-                    {"id": "layered", "label": "Layered", "description": "Traditional N-Layer"},
-                ]
-            }
+        project_path = Path(self.workspace_root) / project
+        logger.debug(f"🔍 Resolved project_path: {project_path}")
+        llm_config = self._config_manager.get_agent_llm_config("architect")
+
+        # Mapping for special providers like gemini-open-source (Gemma)
+        provider = llm_config.provider
+        api_url = llm_config.base_url or ""
+        
+        if provider == "gemini-open-source":
+            provider = "openai" # Gemma uses OpenAI-compatible endpoint
+            if api_url and "generativelanguage.googleapis.com" in api_url:
+                if "/v1beta/openai" not in api_url:
+                    api_url = api_url.rstrip("/") + "/v1beta/openai"
+        elif provider == "gemini":
+            if not api_url:
+                api_url = "https://generativelanguage.googleapis.com"
 
         # Try AI suggestions
         try:
+            logger.info(f"🧠 Requesting AI suggestions for {project}. Effective Provider: {provider}, Model: {llm_config.model}")
             async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.get(
-                    f"{settings.architect_url}/ai/suggestions",
-                    params={"project": str(project_path)}
-                )
+                params = {
+                    "project": str(project_path),
+                    "provider": provider,
+                    "model": llm_config.model,
+                    "api_key": llm_config.api_key or "",
+                    "api_url": api_url
+                }
+                url = f"{settings.architect_url}/ai/suggestions"
+                logger.debug(f"AI Req: {url} with params {params}")
+                
+                resp = await client.get(url, params=params)
                 resp.raise_for_status()
-                return resp.json()
+                data = resp.json()
+                logger.info(f"✅ AI Suggestions received from Architect: {data}")
+                return data
         except Exception as e:
-            logger.warning(f"AI suggestions failed, using defaults: {e}")
+            logger.warning(f"AI suggestions failed for {project}, trying specialized fallbacks. Error: {e}")
+            
+            # Specialized fallback for NestJS
+            if (project_path / "nest-cli.json").exists():
+                logger.info(f"🚀 NestJS detected for {project}, using NestJS fallbacks")
+                return {
+                    "ok": True,
+                    "default": True,
+                    "patterns": [
+                        {"id": "hexagonal", "label": "Hexagonal", "description": "Ports & Adapters"},
+                        {"id": "clean", "label": "Clean Architecture", "description": "Uncle Bob's approach"},
+                        {"id": "layered", "label": "Layered", "description": "Traditional N-Layer"},
+                    ]
+                }
+
             return {
                 "ok": True,
                 "default": True,

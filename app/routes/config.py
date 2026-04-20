@@ -438,6 +438,7 @@ async def get_cerebro_config():
                     "require_approval_critical": cerebro_config.require_approval_critical,
                     "notifier_timeout_mins": cerebro_config.notifier_timeout_mins,
                     "chain_fallback_behavior": cerebro_config.chain_fallback_behavior,
+                    "voice": cerebro_config.voice.model_dump() if hasattr(cerebro_config.voice, 'model_dump') else cerebro_config.voice
                 }
             }
         }
@@ -458,6 +459,7 @@ async def get_cerebro_config():
                     "require_approval_critical": True,
                     "notifier_timeout_mins": 30,
                     "chain_fallback_behavior": "branch_and_wait",
+                    "voice": {"enabled": True, "gender": "neutral", "accent": "es-MX", "rate": 0.92, "pitch": 0.9}
                 }
             }
         }
@@ -466,11 +468,10 @@ async def get_cerebro_config():
 @router.post("/config/cerebro", summary="Update cerebro engine configuration")
 async def update_cerebro_config(request: Request):
     """Update Cerebro engine configuration."""
-    debug_log(f"=== CONFIG CEREBRO POST REQUEST ===")
-    debug_log(f"Headers: {dict(request.headers)}")
+    _log_debug(f"=== CONFIG CEREBRO POST REQUEST ===")
     try:
         body = await request.json()
-        debug_log(f"Parsed body: {body}")
+        _log_debug(f"Parsed body: {body}")
 
         new_config = body.get("config", {})
 
@@ -488,6 +489,24 @@ async def update_cerebro_config(request: Request):
         if cerebro_config is None:
             cerebro_config = CerebroConfig()
             unified_config.cerebro = cerebro_config
+
+        # Update voice settings
+        if "voice" in new_config:
+            voice_data = new_config["voice"]
+            if not cerebro_config.voice:
+                from app.models.config import VoiceConfig
+                cerebro_config.voice = VoiceConfig()
+            
+            if "enabled" in voice_data:
+                cerebro_config.voice.enabled = bool(voice_data["enabled"])
+            if "gender" in voice_data:
+                cerebro_config.voice.gender = voice_data["gender"]
+            if "accent" in voice_data:
+                cerebro_config.voice.accent = voice_data["accent"]
+            if "rate" in voice_data:
+                cerebro_config.voice.rate = float(voice_data["rate"])
+            if "pitch" in voice_data:
+                cerebro_config.voice.pitch = float(voice_data["pitch"])
 
         # Update auto-start agents
         if "auto_start_agents" in new_config:

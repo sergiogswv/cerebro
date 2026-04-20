@@ -45,6 +45,60 @@ class EventRouter:
         async with self._route_lock:
             return await self._route_internal(event)
 
+    async def start_stale_lock_cleanup(self) -> None:
+        """
+        Tarea de fondo (TASK-03): Detecta y libera locks huérfanos.
+        Un lock es huérfano si lleva más de debounce_window * 1.5 segundos sin
+        ser liberado (indica que el Executor crashó sin notificar a Cerebro).
+
+        Se lanza desde el startup de Cerebro como una tarea asyncio de fondo.
+        """
+        import asyncio, time
+        stale_threshold = self._debounce_window * 1.5  # 270 segundos por defecto
+        logger.info(f"🧹 Stale lock cleanup iniciado (threshold={stale_threshold:.0f}s)")
+
+        while True:
+            await asyncio.sleep(60)  # Revisar cada minuto
+            try:
+                now = time.time()
+                stale_keys = [
+                    k for k, ts in list(self._active_processing.items())
+                    if (now - ts) > stale_threshold
+                ]
+                for key in stale_keys:
+                    elapsed = now - self._active_processing.get(key, now)
+                    del self._active_processing[key]
+                    logger.warning(
+                        f"🧹 Lock huérfano liberado: {key} "
+                        f"(llevó {elapsed:.0f}s, threshold={stale_threshold:.0f}s)"
+                    )
+                    await emit_agent_event({
+                        "source": "cerebro",
+                        "type": "stale_lock_released",
+                        "severity": "warning",
+                        "payload": {
+                            "project_key": key,
+                            "elapsed_seconds": round(elapsed),
+                            "threshold_seconds": stale_threshold,
+                            "message": f"🧹 Lock huérfano liberado para: {key[:60]}",
+                        }
+                    })
+            except Exception as cleanup_err:
+                logger.warning(f"⚠️ Error en stale lock cleanup: {cleanup_err}")
+
+    def get_active_locks(self) -> List[Dict]:
+        """Devuelve info de todos los locks activos (para el dashboard de salud)."""
+        import time
+        now = time.time()
+        return [
+            {
+                "key": k,
+                "elapsed_seconds": round(now - ts),
+                "stale": (now - ts) > (self._debounce_window * 1.5),
+            }
+            for k, ts in self._active_processing.items()
+        ]
+
     async def _route_internal(self, event: AgentEvent) -> Dict[str, Any]:
         """
         Route an event to appropriate handlers.
@@ -79,10 +133,91 @@ class EventRouter:
                 logger.info(f"🔍 [Cerebro] Disparando re-análisis de verificación para {file_path}")
                 await send_command("sentinel_core", OrchestratorCommand(action="analyze", target=file_path))
             
-            # 4. Notificar al dashboard antes de terminar
+            # 4. Si era una inicialización de proyecto, marcar como terminada y activar agentes
+            if event.type in ("feature_completed", "feature_failed", "autofix_completed"):
+                try:
+                    import asyncio
+                    from app.orchestrator import orchestrator
+                    
+                    found_project = None
+                    for p in list(orchestrator._initializing_projects):
+                        p_path = orchestrator._projects.get_project_path(p)
+                        # Verificar si el target del evento pertenece a la ruta de este proyecto
+                        if p_path and file_path and (p_path.lower() in file_path.lower() or file_path.lower() in p_path.lower()):
+                            found_project = p
+                            break
+                    
+                    if found_project:
+                        logger.info(f"✨ [Cerebro] Proyecto `{found_project}` construido y verificado. Actualizando estado en DB.")
+                        # ✅ Usar DB en lugar del set en memoria (persistente ante reinicios)
+                        new_state = 'active' if event.type.endswith('_completed') else 'error'
+                        self.context_db.set_project_state(
+                            found_project, new_state,
+                            metadata={'finished_by': event.type, 'event_id': event.id}
+                        )
+                        
+                        if event.type.endswith("_completed"):
+                            await notify(f"🚀 **Proyecto `{found_project}` listo:** estructura construida y Verificación de Runtime EXITOSA.", level="success")
+                            # Trigger Tribunal y Activación de Agentes
+                            if orchestrator.active_project == found_project:
+                                logger.info(f"🔄 Activando agentes para `{found_project}` tras construcción exitosa.")
+                                asyncio.create_task(orchestrator.set_active_project(found_project))
+
+                    # 💡 REGISTRAR APRENDIZAJE: Registrar el éxito/fallo como un outcome
+                    if self.context_db:
+                        outcome_type = "correct" if "_completed" in event.type else "false_negative"
+                        self.context_db.record_outcome(
+                            event_id=event.id,
+                            file_path=file_path or found_project,
+                            outcome_type=outcome_type,
+                            outcome_details=f"Executor {event.type}: {event.payload.get('message', '')}",
+                            auto_detected=True
+                        )
+                except Exception as ex:
+                    logger.warning(f"⚠️ Error finalizando estado de inicialización o registrando outcome: {ex}")
+
+            # TASK-05: Feedback automático basado en el resultado del build ────────
+            # Si el Executor reporta éxito/fracaso de build, registramos feedback
+            # automático para cerrar el loop de aprendizaje sin intervención humana.
+            if self.context_db and event.type in (
+                "autofix_completed", "autofix_failed",
+                "feature_completed", "feature_failed",
+                "bugfix_completed",  "bugfix_failed",
+            ):
+                try:
+                    build_success = event.type.endswith("_completed")
+                    build_exit   = event.payload.get("build_exit_code")
+                    # Si build_exit_code está disponible, usarlo para mayor precisión
+                    if build_exit is not None:
+                        build_success = (build_exit == 0)
+
+                    auto_feedback_type = "thumbs_up" if build_success else "thumbs_down"
+                    auto_reason = (
+                        f"Auto-feedback: {'Build exitoso ✅' if build_success else 'Build fallido ❌'}"
+                        f" | {event.type}"
+                        + (f" | exit_code={build_exit}" if build_exit is not None else "")
+                    )
+
+                    self.context_db.record_feedback(
+                        event_id=event.id,
+                        feedback_type=auto_feedback_type,
+                        decision_actions=event.payload.get("actions"),
+                        reason=auto_reason,
+                        suggested_action=None,
+                    )
+                    logger.info(
+                        f"🤖 [AutoFeedback] {auto_feedback_type} registrado automáticamente "
+                        f"para {event.type} ({file_path or 'unknown'})"
+                    )
+                except Exception as fb_err:
+                    logger.debug(f"No se pudo registrar auto-feedback: {fb_err}")
+
+            # 5. Notificar al dashboard antes de terminar
             await emit_agent_event(event.model_dump(mode="json"))
+
                 
             return {"action": "resume_cycle", "status": "completed"}
+
 
         # Emit to dashboard first (except for file_change which is decorated below
         # and analysis_completed which has its own de-duplication logic)
@@ -158,8 +293,17 @@ class EventRouter:
                 to_del = [k for k, v in self._active_processing.items() if (now - v) >= self._debounce_window]
                 for k in to_del: del self._active_processing[k]
 
-            # Si estamos en modo ADK, reenviar al ADK para análisis LLM
-            if settings.sentinel_mode == "adk":
+            from app.config import SentinelMode
+            # Enrutar basado en el modo operativo
+            if settings.sentinel_mode == SentinelMode.CORE_ONLY.value:
+                # Ya tenemos el análisis rudimentario del core en event.payload, lo dejamos pasar.
+                pass
+            elif settings.sentinel_mode in (SentinelMode.ADK_ONLY.value, SentinelMode.HYBRID.value):
+                # TASK-12: Cache de decisiones LLM para evitar gastar tokens en cambios triviales
+                should_invoke = await self._should_invoke_adk(file_path)
+                if not should_invoke:
+                    return {"action": "forward_to_adk", "status": "skipped", "reason": "cache_hit"}
+
                 logger.info(f"📡 [Cerebro] Reenviando a ADK para análisis LLM: {file_path}")
 
                 # Emitir evento de transición
@@ -420,7 +564,7 @@ class EventRouter:
         return await self._evaluate_standard(event)
 
     async def _trigger_tribunal(self, repo_dir: str, target: str, target_abs: str):
-        """Dispara de manera encadenada a Sentinel, Architect y Warden tras la implementación de un requerimiento manual."""
+        """Dispara de manera simultánea a Sentinel, Architect y Warden tras la implementación de un requerimiento manual."""
         from app.dispatcher import send_raw_command
         from app.sockets import emit_agent_event
         import uuid
@@ -428,78 +572,86 @@ class EventRouter:
 
         await emit_agent_event({
             "source": "cerebro", "type": "tribunal_started", "severity": "info",
-            "payload": {"message": f"Iniciando TRIBUNAL (validación multi-agente) para código generado en {target}"}
+            "payload": {"message": f"Iniciando TRIBUNAL (validación multi-agente paralela) para {target}"}
         })
-        logger.info(f"⚖️ Iniciando TRIBUNAL multi-agente para {target}")
+        logger.info(f"⚖️ Iniciando TRIBUNAL multi-agente paralelo para {target}")
 
-        try: 
-            # 1. Sentinel (siempre al Core, no al ADK)
-            logger.info("⚖️ -> Ejecutando Sentinel...")
-            ack_sentinel = await send_raw_command("sentinel_core", {
-                "action": "pro", "subcommand": "check",
-                "target": target_abs or repo_dir,
-                "request_id": f"sentinel-{uuid.uuid4().hex[:8]}"
-            })
-            if ack_sentinel and self.context_db:
-                result_data = ack_sentinel.get("result", {})
-                analysis = result_data.get("analysis") or result_data.get("summary")
-                if analysis:
-                    self.context_db.record_pattern(
-                        pattern_type="sentinel_tribunal_analysis",
-                        description=analysis[:500],
-                        severity="info",
-                        file_path=target,
-                        metadata={"full_analysis": analysis, "source": "sentinel"}
-                    )
-            await asyncio.sleep(6)  # Darle margen a Sentinel
+        async def safe_agent_call(name, action, subcommand, timeout=30):
+            try:
+                command = {
+                    "action": action,
+                    "subcommand": subcommand,
+                    "target": target_abs or repo_dir,
+                    "request_id": f"{name}-{uuid.uuid4().hex[:8]}"
+                }
+                logger.debug(f"⚖️ -> Pidiendo a {name}...")
+                result = await asyncio.wait_for(send_raw_command(name, command), timeout=timeout)
+                return {"agent": name, "status": "ok", "result": result}
+            except asyncio.TimeoutError:
+                logger.warning(f"⚠️ Timeout esperando a {name} en tribunal")
+                return {"agent": name, "status": "timeout"}
+            except Exception as e:
+                logger.error(f"❌ Error en {name} durante tribunal: {e}")
+                return {"agent": name, "status": "error", "error": str(e)}
 
-            # 2. Architect
-            logger.info("⚖️ -> Ejecutando Architect...")
-            ack_architect = await send_raw_command("architect", {
-                "action": "pro", "subcommand": "review",
-                "target": target_abs or repo_dir,
-                "request_id": f"architect-{uuid.uuid4().hex[:8]}"
-            })
-            if ack_architect and self.context_db:
-                result_data = ack_architect.get("result", {})
-                analysis = result_data.get("analysis") or result_data.get("feedback")
-                if analysis:
-                    self.context_db.record_pattern(
-                        pattern_type="architect_tribunal_review",
-                        description=analysis[:500],
-                        severity="info",
-                        file_path=target,
-                        metadata={"full_analysis": analysis, "source": "architect"}
-                    )
-            await asyncio.sleep(6)
+        try:
+            # Ejecutar de manera concurrente
+            results = await asyncio.gather(
+                safe_agent_call("sentinel_core", "pro", "check"),
+                safe_agent_call("architect", "pro", "review"),
+                safe_agent_call("warden", "pro", "scan"),
+                return_exceptions=True
+            )
 
-            # 3. Warden
-            logger.info("⚖️ -> Ejecutando Warden...")
-            ack_warden = await send_raw_command("warden", {
-                "action": "pro", "subcommand": "scan",
-                "target": target_abs or repo_dir,
-                "request_id": f"warden-{uuid.uuid4().hex[:8]}"
-            })
-            if ack_warden and self.context_db:
-                result_data = ack_warden.get("result", {})
-                finding = result_data.get("finding") or result_data.get("summary")
-                if finding:
-                    self.context_db.record_pattern(
-                        pattern_type="warden_tribunal_scan",
-                        description=finding[:500],
-                        severity="warning",
-                        file_path=target,
-                        metadata={"full_finding": finding, "source": "warden"}
-                    )
-            
+            # Procesar los resultados
+            for r in results:
+                if isinstance(r, dict) and r.get("status") == "ok":
+                    agent = r["agent"]
+                    ack = r["result"]
+                    if not ack or not self.context_db:
+                        continue
+                        
+                    result_data = ack.get("result", {})
+                    
+                    if agent == "sentinel_core":
+                        analysis = result_data.get("analysis") or result_data.get("summary")
+                        if analysis:
+                            self.context_db.record_pattern(
+                                pattern_type="sentinel_tribunal_analysis",
+                                description=analysis[:500],
+                                severity="info",
+                                file_path=target,
+                                metadata={"full_analysis": analysis, "source": "sentinel"}
+                            )
+                    elif agent == "architect":
+                        analysis = result_data.get("analysis") or result_data.get("feedback")
+                        if analysis:
+                            self.context_db.record_pattern(
+                                pattern_type="architect_tribunal_review",
+                                description=analysis[:500],
+                                severity="info",
+                                file_path=target,
+                                metadata={"full_analysis": analysis, "source": "architect"}
+                            )
+                    elif agent == "warden":
+                        finding = result_data.get("finding") or result_data.get("summary")
+                        if finding:
+                            self.context_db.record_pattern(
+                                pattern_type="warden_tribunal_scan",
+                                description=finding[:500],
+                                severity="warning",
+                                file_path=target,
+                                metadata={"full_finding": finding, "source": "warden"}
+                            )
+
             await emit_agent_event({
                 "source": "cerebro", "type": "tribunal_completed", "severity": "success",
                 "payload": {"message": f"Tribunal desplegado correctamente sobre {target}"}
             })
-            logger.info(f"✅ TRIBUNAL lanzado exitosamente para {target} y guardado en ContextDB")
+            logger.info(f"✅ TRIBUNAL lanzado exitosamente para {target} (paralelo)")
 
         except Exception as e:
-            logger.error(f"❌ Error lanzando el tribunal: {e}")
+            logger.error(f"❌ Error lanzando el tribunal paralelo: {e}")
 
 
     # ── RUTEO HABITUAL ── 
@@ -517,17 +669,35 @@ class EventRouter:
             f"reason={decision.reason}"
         )
 
+        # TASK-14: Trazar decisión en la DB de contexto
+        if self.context_db:
+            try:
+                self.context_db.log_decision_trace(
+                    event_id=event.id,
+                    node="decision_engine",
+                    decision=",".join([a.value for a in decision.actions]),
+                    context={"reason": decision.reason, "auto_mode": self._is_auto_mode_enabled()}
+                )
+            except Exception as e:
+                logger.debug(f"Error logging decision trace: {e}")
+
         # Emitir decisión al timeline
+        import uuid as _uuid
+        decision_id = str(_uuid.uuid4())
         await emit_agent_event({
             "source": "cerebro",
             "type": "decision",
+            "id": decision_id,   # Este ID se usa para el feedback del usuario
             "severity": "info",
             "payload": {
+                "decision_id": decision_id,
                 "actions": [a.value for a in decision.actions],
                 "reason": decision.reason,
+                "confidence": round(decision.confidence, 2),
                 "message": f"🧠 Cerebro decidió: {decision.reason} (Acciones: {', '.join([a.value for a in decision.actions]) or 'Ninguna'})",
                 "event_type": event.type,
-                "event_source": event.source
+                "event_source": event.source,
+                "target_agents": decision.target_agents,
             }
         })
 
@@ -568,7 +738,13 @@ class EventRouter:
         if not self.context_db:
             return
 
-        file_path = event.payload.get("file") if event.payload else None
+        file_path = (
+            event.payload.get("file") or 
+            event.payload.get("target") or 
+            event.payload.get("path") or 
+            event.payload.get("project")
+        ) if event.payload else None
+
         if file_path:
             self.context_db.record_event(
                 file_path=file_path,
@@ -578,6 +754,7 @@ class EventRouter:
                 payload=event.payload,
                 decision_actions=[a.value for a in decision.actions],
             )
+
 
     async def _handle_notify(self, event: AgentEvent, decision) -> Dict:
         """Send notification to user."""
@@ -792,6 +969,37 @@ class EventRouter:
             logger.error(f"Interaction error: {e}")
             return {"action": "interaction", "status": "error", "error": str(e)}
 
+    async def _should_invoke_adk(self, file_path: str) -> bool:
+        """Verifica si el archivo cambió lo suficiente o si usamos el cache. Evita malgastar tokens."""
+        import os
+        import hashlib
+        import time
+        if not os.path.exists(file_path):
+            return True
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            # Clean comments and whitespace
+            import re
+            cleaned_content = re.sub(r'#.*', '', content)
+            cleaned_content = re.sub(r'//.*', '', cleaned_content)
+            cleaned_content = "".join(cleaned_content.split())
+            change_hash = hashlib.md5(cleaned_content.encode()).hexdigest()
+
+            if not hasattr(self, '_adk_cache'):
+                self._adk_cache = {}
+
+            last_time, last_hash = self._adk_cache.get(file_path, (0, ""))
+            if last_hash == change_hash and (time.time() - last_time) < 600:
+                logger.info(f"💾 [Cerebro] Usando análisis cacheado para {file_path} (mismo contenido sustantivo)")
+                return False
+            
+            self._adk_cache[file_path] = (time.time(), change_hash)
+            return True
+        except Exception as e:
+            logger.debug(f"Error checkeando cache ADK en {file_path}: {e}")
+            return True
+
     def _is_auto_mode_enabled(self) -> bool:
         """Verifica si el modo autónomo está habilitado en la configuración."""
         try:
@@ -829,7 +1037,7 @@ class EventRouter:
                 )
             )
 
-            if ack.get("status") == "completed":
+            if ack.get("status") == "completed" or (ack.get("result") and ack.get("result").get("status") == "completed"):
                 logger.info(f"✅ [Cerebro] ADK completó análisis de {file_path}")
                 return {
                     "action": "forward_to_adk",
@@ -838,22 +1046,66 @@ class EventRouter:
                     "adk_result": ack.get("result")
                 }
             else:
-                logger.warning(f"⚠️ [Cerebro] ADK no completó análisis: {ack.get('error', 'Unknown error')}")
+                logger.warning(f"⚠️ [Cerebro] ADK no completó análisis: {ack.get('error', 'Unknown error')} - Iniciando fallback a Core")
+                
+                # Fallback al Core Rust
+                from app.sockets import emit_agent_event
+                await emit_agent_event({
+                    "source": "cerebro", "type": "degraded_mode_active", "severity": "warning",
+                    "payload": {"reason": "adk_unavailable", "fallback": "core_static", "file": file_path}
+                })
+
+                import uuid
+                from app.dispatcher import send_raw_command
+                logger.info("🛡️ Sentinel en modo degradado: Usando Core Rust estático")
+                fallback_ack = await send_raw_command("sentinel_core", {
+                    "action": "pro", "subcommand": "check",
+                    "target": file_path,
+                    "request_id": f"sentinel-fb-{uuid.uuid4().hex[:8]}"
+                })
+                
                 return {
                     "action": "forward_to_adk",
-                    "status": "failed",
+                    "status": "degraded_success" if fallback_ack and fallback_ack.get("status") == "completed" else "failed",
                     "file": file_path,
+                    "fallback_used": True,
+                    "adk_result": fallback_ack.get("result") if fallback_ack else None,
                     "error": ack.get("error")
                 }
 
         except Exception as exc:
-            logger.error(f"❌ [Cerebro] Error reenviando a ADK: {exc}")
-            return {
-                "action": "forward_to_adk",
-                "status": "error",
-                "file": file_path,
-                "error": str(exc)
-            }
+            logger.error(f"❌ [Cerebro] Error reenviando a ADK: {exc} - Iniciando fallback a Core")
+            from app.sockets import emit_agent_event
+            await emit_agent_event({
+                "source": "cerebro", "type": "degraded_mode_active", "severity": "warning",
+                "payload": {"reason": "adk_exception", "fallback": "core_static", "file": file_path}
+            })
+            
+            try:
+                import uuid
+                from app.dispatcher import send_raw_command
+                fallback_ack = await send_raw_command("sentinel_core", {
+                    "action": "pro", "subcommand": "check",
+                    "target": file_path,
+                    "request_id": f"sentinel-fb-{uuid.uuid4().hex[:8]}"
+                })
+                return {
+                    "action": "forward_to_adk",
+                    "status": "degraded_success" if fallback_ack and fallback_ack.get("status") == "completed" else "failed",
+                    "file": file_path,
+                    "fallback_used": True,
+                    "adk_result": fallback_ack.get("result") if fallback_ack else None,
+                    "error": str(exc)
+                }
+            except Exception as fb_exc:
+                logger.error(f"❌ [Cerebro] Ambos ADK y Core fallaron para {file_path}: {fb_exc}")
+                return {
+                    "action": "forward_to_adk",
+                    "status": "error",
+                    "file": file_path,
+                    "error": str(exc),
+                    "fallback_error": str(fb_exc)
+                }
 
     async def _dispatch_to_executor(self, event: AgentEvent, task_description: str, file_hint: str | None, task_type: str) -> Dict:
         """

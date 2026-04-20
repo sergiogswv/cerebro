@@ -99,6 +99,16 @@ CREATE TABLE IF NOT EXISTS decision_outcomes (
     timestamp TEXT NOT NULL
 );
 
+-- Trazas granulares del proceso de toma de decisiones
+CREATE TABLE IF NOT EXISTS decision_trace (
+    id TEXT PRIMARY KEY,
+    event_id TEXT,
+    node TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    context TEXT,
+    timestamp TEXT NOT NULL
+);
+
 -- Reglas aprendidas (ajustadas por feedback)
 CREATE TABLE IF NOT EXISTS learned_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,6 +122,15 @@ CREATE TABLE IF NOT EXISTS learned_rules (
     active BOOLEAN DEFAULT TRUE
 );
 
+-- Estado de proyectos (persistido para sobrevivir reinicios de Cerebro)
+CREATE TABLE IF NOT EXISTS project_states (
+    project_name TEXT PRIMARY KEY,
+    state TEXT NOT NULL,        -- 'initializing' | 'active' | 'error' | 'idle'
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    metadata TEXT               -- JSON: contexto adicional del estado
+);
+
 -- Índices para consultas rápidas
 CREATE INDEX IF NOT EXISTS idx_file_events_path ON file_events(file_path);
 CREATE INDEX IF NOT EXISTS idx_file_events_timestamp ON file_events(timestamp);
@@ -119,6 +138,7 @@ CREATE INDEX IF NOT EXISTS idx_file_events_severity ON file_events(severity);
 CREATE INDEX IF NOT EXISTS idx_detected_patterns_type ON detected_patterns(pattern_type);
 CREATE INDEX IF NOT EXISTS idx_user_feedback_event ON user_feedback(event_id);
 CREATE INDEX IF NOT EXISTS idx_decision_outcomes_event ON decision_outcomes(event_id);
+CREATE INDEX IF NOT EXISTS idx_project_states_state ON project_states(state);
 """
 
 
@@ -969,83 +989,141 @@ class ContextDB:
         Analiza últimos eventos y feedback para sugerir ajustes de reglas.
 
         Args:
-            limit: Cantidad de eventos a analizar
+            limit: Cantidad de feedbacks a analizar
 
         Returns:
-            Dict con sugerencias de ajustes
+            Dict con sugerencias estructuradas incluyendo consistency scores.
+            Cada sugerencia en `rule_adjustments` tiene `sample_size` y `consistency`
+            para que el scheduler decida si aplicar o no la regla automáticamente.
         """
         conn = self._get_connection()
 
-        # Obtener últimos eventos con feedback negativo
+        # ── Obtener todo el feedback reciente (positivo y negativo) ────────────
         cursor = conn.execute(
             """
             SELECT
                 fe.event_type,
                 fe.severity,
                 fe.decision_actions,
+                uf.feedback_type,
                 uf.reason,
                 uf.suggested_action,
                 fe.file_path
             FROM file_events fe
             JOIN user_feedback uf ON fe.id = uf.event_id
-            WHERE uf.feedback_type = 'thumbs_down'
-            ORDER BY fe.timestamp DESC
+            ORDER BY uf.timestamp DESC
             LIMIT ?
             """,
             (limit,)
         )
 
-        negative_feedback = []
+        all_feedback = []
         for row in cursor:
-            negative_feedback.append({
-                "event_type": row["event_type"],
-                "severity": row["severity"],
+            all_feedback.append({
+                "event_type":      row["event_type"],
+                "severity":        row["severity"],
                 "decision_actions": json.loads(row["decision_actions"]) if row["decision_actions"] else None,
-                "reason": row["reason"],
+                "feedback_type":   row["feedback_type"],
+                "reason":          row["reason"],
                 "suggested_action": row["suggested_action"],
-                "file_path": row["file_path"],
+                "file_path":       row["file_path"],
             })
 
-        # Analizar patrones de feedback negativo
-        suggestions = []
-
-        # Agrupar por tipo de evento y severidad
-        patterns = {}
-        for fb in negative_feedback:
+        # ── Agrupar por patrón (event_type:severity) ──────────────────────────
+        patterns: Dict[str, Dict] = {}
+        for fb in all_feedback:
             key = f"{fb['event_type']}:{fb['severity']}"
             if key not in patterns:
-                patterns[key] = {"count": 0, "suggestions": [], "files": []}
+                patterns[key] = {
+                    "count":     0,
+                    "positives": 0,
+                    "negatives": 0,
+                    "suggestions": [],
+                    "files":     [],
+                }
             patterns[key]["count"] += 1
+            if fb["feedback_type"] == "thumbs_up":
+                patterns[key]["positives"] += 1
+            else:
+                patterns[key]["negatives"] += 1
             if fb["suggested_action"]:
                 patterns[key]["suggestions"].append(fb["suggested_action"])
             if fb["file_path"]:
                 patterns[key]["files"].append(fb["file_path"])
 
-        # Generar sugerencias para patrones con 2+ feedbacks negativos
+        # ── Generar sugerencias con consistency score ──────────────────────────
+        suggestions = []
+        rule_adjustments = []  # Formato estructurado para auto-aplicación
+
         for pattern, data in patterns.items():
-            if data["count"] >= 2:
-                event_type, severity = pattern.split(":")
+            total = data["count"]
+            if total < 2:
+                continue
 
-                # Sugerir ajuste de severidad
-                if severity == "error" and data["count"] >= 3:
+            pos = data["positives"]
+            neg = data["negatives"]
+            consistency = max(pos, neg) / total  # 0.5 → 1.0
+            event_type, severity = pattern.split(":", 1)
+
+            # Feedback mayoritariamente negativo → reducir agresividad
+            if neg > pos and neg >= 2:
+                suggestions.append({
+                    "type":        "severity_adjustment",
+                    "description": f"Reducir agresividad de '{event_type}' ({neg}/{total} negativos)",
+                    "reason":      f"{neg} feedbacks negativos vs {pos} positivos",
+                    "confidence":  min(1.0, neg / 5.0),
+                    "consistency": consistency,
+                    "sample_size": total,
+                })
+                rule_adjustments.append({
+                    "id":          f"adj_{pattern}_{total}",
+                    "rule_type":   "autofix_confidence_threshold",
+                    "pattern":     pattern,
+                    "event_type":  event_type,
+                    "severity":    severity,
+                    "direction":   "increase_threshold",  # Ser más conservador
+                    "consistency": consistency,
+                    "sample_size": total,
+                    "negative_ratio": neg / total,
+                    "suggested_adjustment": {
+                        "key":   f"confidence_threshold_for_{event_type}",
+                        "value": min(0.95, 0.8 + (neg / total) * 0.15),  # Subir umbral
+                    },
+                })
+
+            # Feedback mayoritariamente positivo → mantener o reforzar
+            elif pos > neg and pos >= 3:
+                rule_adjustments.append({
+                    "id":          f"pos_{pattern}_{total}",
+                    "rule_type":   "autofix_confidence_threshold",
+                    "pattern":     pattern,
+                    "event_type":  event_type,
+                    "severity":    severity,
+                    "direction":   "decrease_threshold",  # Ser más activo
+                    "consistency": consistency,
+                    "sample_size": total,
+                    "negative_ratio": neg / total,
+                    "suggested_adjustment": {
+                        "key":   f"confidence_threshold_for_{event_type}",
+                        "value": max(0.6, 0.8 - (pos / total) * 0.1),  # Bajar umbral
+                    },
+                })
+
+            # Sugerir cambio de acción si hay sugerencias consistentes
+            if data["suggestions"]:
+                most_common = max(set(data["suggestions"]), key=data["suggestions"].count)
+                freq = data["suggestions"].count(most_common)
+                if freq >= 2:
                     suggestions.append({
-                        "type": "severity_adjustment",
-                        "description": f"Reducir severidad de {event_type} de error a warning",
-                        "reason": f"{data['count']} feedbacks negativos",
-                        "confidence": min(1.0, data["count"] / 5.0),
+                        "type":        "action_adjustment",
+                        "description": f"Para '{event_type}': {most_common}",
+                        "reason":      f"Sugerido {freq} de {len(data['suggestions'])} veces",
+                        "confidence":  min(1.0, freq / 5.0),
+                        "consistency": freq / len(data["suggestions"]),
+                        "sample_size": len(data["suggestions"]),
                     })
 
-                # Sugerir cambio de acción
-                if data["suggestions"]:
-                    most_common_suggestion = max(set(data["suggestions"]), key=data["suggestions"].count)
-                    suggestions.append({
-                        "type": "action_adjustment",
-                        "description": f"Para {event_type}, {most_common_suggestion}",
-                        "reason": f"Sugerido {len(data['suggestions'])} veces",
-                        "confidence": min(1.0, len(data["suggestions"]) / 5.0),
-                    })
-
-        # Obtener outcomes para análisis adicional
+        # ── Auto-detected outcomes ─────────────────────────────────────────────
         cursor = conn.execute(
             """
             SELECT outcome_type, COUNT(*) as count
@@ -1054,14 +1132,20 @@ class ContextDB:
             GROUP BY outcome_type
             """
         )
-
         auto_detected_outcomes = {row["outcome_type"]: row["count"] for row in cursor}
 
+        # ── Stats de feedback ──────────────────────────────────────────────────
+        total_pos = sum(p["positives"] for p in patterns.values())
+        total_neg = sum(p["negatives"] for p in patterns.values())
+
         return {
-            "negative_feedback_count": len(negative_feedback),
-            "patterns": patterns,
-            "suggestions": suggestions,
-            "auto_detected_outcomes": auto_detected_outcomes,
+            "negative_feedback_count": total_neg,
+            "positive_feedback_count": total_pos,
+            "total_feedback":          total_pos + total_neg,
+            "patterns":                patterns,
+            "suggestions":             suggestions,
+            "rule_adjustments":        rule_adjustments,  # Para auto-aplicación
+            "auto_detected_outcomes":  auto_detected_outcomes,
         }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1178,6 +1262,145 @@ class ContextDB:
     def is_vector_available(self) -> bool:
         """Retorna True si VectorStore está disponible y funcionando."""
         return self._vector_store is not None and self._vector_store.is_available()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # MÉTODOS DE ESTADO DE PROYECTOS (TASK-02: Persistencia ante reinicios)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def set_project_state(
+        self,
+        project_name: str,
+        state: str,
+        metadata: Optional[Dict] = None,
+    ) -> None:
+        """
+        Persiste el estado de un proyecto en la DB.
+
+        Args:
+            project_name: Nombre del proyecto
+            state: 'initializing' | 'active' | 'error' | 'idle'
+            metadata: Contexto adicional (tipo de init, timestamp de inicio, etc.)
+        """
+        now = datetime.utcnow().isoformat()
+        conn = self._get_connection()
+        conn.execute(
+            """
+            INSERT INTO project_states (project_name, state, started_at, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(project_name) DO UPDATE SET
+                state      = excluded.state,
+                updated_at = excluded.updated_at,
+                metadata   = COALESCE(excluded.metadata, metadata)
+            """,
+            (
+                project_name,
+                state,
+                now,  # started_at solo se setea en INSERT, COALESCE lo protege
+                now,
+                json.dumps(metadata) if metadata else None,
+            ),
+        )
+        conn.commit()
+        logger.info(f"📌 Estado de proyecto persistido: {project_name} → {state}")
+
+    def get_project_state(self, project_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Obtiene el estado persistido de un proyecto.
+
+        Returns:
+            Dict con project_name, state, started_at, updated_at, metadata
+            o None si no existe registro.
+        """
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT * FROM project_states WHERE project_name = ?",
+            (project_name,),
+        ).fetchone()
+
+        if not row:
+            return None
+
+        return {
+            "project_name": row["project_name"],
+            "state":        row["state"],
+            "started_at":   row["started_at"],
+            "updated_at":   row["updated_at"],
+            "metadata":     json.loads(row["metadata"]) if row["metadata"] else None,
+        }
+
+    def get_projects_by_state(self, state: str) -> List[str]:
+        """
+        Devuelve los nombres de proyectos en un estado específico.
+        Usado para reconstruir `_initializing_projects` tras un reinicio.
+
+        Args:
+            state: Estado a filtrar ('initializing', 'active', etc.)
+
+        Returns:
+            Lista de nombres de proyectos en ese estado
+        """
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT project_name FROM project_states WHERE state = ?",
+            (state,),
+        ).fetchall()
+        return [row["project_name"] for row in rows]
+
+    def clear_project_state(self, project_name: str) -> None:
+        """Elimina el registro de estado de un proyecto (tras activación o error resuelto)."""
+        conn = self._get_connection()
+        conn.execute(
+            "DELETE FROM project_states WHERE project_name = ?",
+            (project_name,),
+        )
+        conn.commit()
+        logger.info(f"🗑️  Estado eliminado para proyecto: {project_name}")
+
+    def get_all_project_states(self) -> List[Dict[str, Any]]:
+        """Devuelve todos los estados de proyectos registrados (útil para el dashboard)."""
+        conn = self._get_connection()
+        rows = conn.execute(
+            "SELECT * FROM project_states ORDER BY updated_at DESC"
+        ).fetchall()
+        return [
+            {
+                "project_name": r["project_name"],
+                "state":        r["state"],
+                "started_at":   r["started_at"],
+                "updated_at":   r["updated_at"],
+                "metadata":     json.loads(r["metadata"]) if r["metadata"] else None,
+            }
+            for r in rows
+        ]
+
+    def log_decision_trace(self, event_id: str, node: str, decision: str, context: Optional[dict] = None) -> bool:
+        """
+        Registra un paso en el proceso de toma de decisiones (TASK-14).
+        """
+        try:
+            import uuid
+            trace_id = f"trace-{uuid.uuid4().hex[:12]}"
+            with self._get_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO decision_trace
+                    (id, event_id, node, decision, context, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        trace_id,
+                        event_id,
+                        node,
+                        decision,
+                        json.dumps(context) if context else None,
+                        datetime.utcnow().isoformat()
+                    )
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error en log_decision_trace: {e}")
+            return False
 
 
 # Instancia global (lazy initialization)

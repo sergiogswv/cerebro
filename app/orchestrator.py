@@ -1,6 +1,8 @@
 """Refactored Orchestrator using specialized components."""
 
 import logging
+import os
+from pathlib import Path
 from typing import Dict, Any, Optional
 
 from app.config import get_settings
@@ -45,14 +47,35 @@ class Orchestrator:
         self._agents = AgentManager(settings.workspace_root, self.context_db)
         self._events = EventRouter(self.decision_engine, self.context_db)
         self._projects = ProjectManager(settings.workspace_root)
+        # _initializing_projects ya NO es un set en memoria.
+        # Se persiste en context_db.project_states para sobrevivir reinicios.
+        # Usar self._initializing_projects (property) o context_db.get_projects_by_state()
 
         # Wire up pipeline
         self._pipeline.set_active_project(self._projects.active_project)
+
+        # Recuperar proyectos en estado 'initializing' que sobrevivieron un reinicio
+        _recovered = self.context_db.get_projects_by_state('initializing')
+        if _recovered:
+            logger.warning(
+                f"⚡ Cerebro reiniciado durante init de proyectos: {_recovered}. "
+                f"Marcando como 'error' para no bloquear agentes."
+            )
+            for p in _recovered:
+                self.context_db.set_project_state(p, 'error', metadata={'reason': 'cerebro_restart'})
 
     @property
     def workspace_root(self) -> str:
         """Get the workspace root directory."""
         return self._projects.workspace_root
+
+    @property
+    def _initializing_projects(self) -> set:
+        """
+        Proyectos en proceso de inicialización AI.
+        Lee desde la DB para ser resistente a reinicios de Cerebro.
+        """
+        return set(self.context_db.get_projects_by_state('initializing'))
 
     @workspace_root.setter
     def workspace_root(self, value: str):
@@ -151,13 +174,29 @@ class Orchestrator:
     # ═══════════════════════════════════════════════════════════════════════
 
     async def bootstrap(self) -> Dict:
-        """Bootstrap system."""
+        """Bootstrap system and restore previous active state."""
+        logger.info("🚀 Starting bootstrap")
+        
+        # 1. Recuperar proyecto activo previo
+        active_projects = self.context_db.get_projects_by_state('active')
+        if active_projects:
+            last_active = active_projects[0]
+            logger.info(f"♻️  Restoring last active project: {last_active}")
+            # Gatillar todos los side-effects (Sentinel, etc)
+            await self.set_active_project(last_active)
+
         return await self._projects.bootstrap()
 
     async def set_active_project(self, project: str) -> Dict:
         """Set active project and start monitoring with prioritized agents."""
+        is_initializing = project in self._initializing_projects
+        logger.info(f"🔍 [set_active_project] Checking `{project}` | is_initializing={is_initializing} | current_set={self._initializing_projects}")
+
         async def activate(project_name: str):
             """Callback when project is activated."""
+            if is_initializing:
+                logger.info(f"⏭️ Skipping agent activation for `{project_name}` (AI Initialization in progress)")
+                return
             from app.dispatcher import send_command, notify as dispatcher_notify
             from app.models import OrchestratorCommand
             import httpx
@@ -178,6 +217,22 @@ class Orchestrator:
             from app.config import get_settings
             settings = get_settings()
             executor_url = settings.executor_url
+
+            # Pre-population of .sentinelrc.toml if it doesn't exist to ensure stable headless startup
+            # and inherit global AI configurations automatically.
+            sentinel_rc_path = Path(project_path) / ".sentinelrc.toml"
+            if not sentinel_rc_path.exists():
+                logger.info(f"🛡️ .sentinelrc.toml not found for {project_name}. Generating headless global AI config...")
+                try:
+                    import toml
+                    config = await self._agents._generate_sentinel_config(
+                        Path(project_path), False, "headless-init"
+                    )
+                    with open(sentinel_rc_path, "w", encoding="utf-8") as f:
+                        toml.dump(config, f)
+                    logger.info("✅ Headless Sentinel config generated successfully.")
+                except Exception as e:
+                    logger.error(f"❌ Failed to generate headless Sentinel config: {e}")
 
             # Start each agent in priority order
             for agent_name in auto_start_agents:
@@ -380,26 +435,139 @@ class Orchestrator:
         self._pipeline.set_active_project(project)
 
         # Arrancar ProactiveScheduler para el nuevo proyecto activo
-        try:
-            from app.proactive_scheduler import get_proactive_scheduler
-            scheduler = get_proactive_scheduler()
-            if not scheduler._running:
-                import asyncio
-                asyncio.create_task(scheduler.start(project))
-                logger.info(f"📅 ProactiveScheduler arrancado para proyecto '{project}'")
-            else:
-                # Si ya corría, re-configurar con el proyecto nuevo
-                scheduler._project = project
-                scheduler.config = scheduler.get_config(project)
-                logger.info(f"📅 ProactiveScheduler re-configurado para '{project}'")
-        except Exception as exc:
-            logger.warning(f"⚠️  No se pudo iniciar ProactiveScheduler: {exc}")
+        if not is_initializing:
+            try:
+                from app.proactive_scheduler import get_proactive_scheduler
+                scheduler = get_proactive_scheduler()
+                if not scheduler._running:
+                    import asyncio
+                    asyncio.create_task(scheduler.start(project))
+                    logger.info(f"📅 ProactiveScheduler arrancado para proyecto '{project}'")
+                else:
+                    # Si ya corría, re-configurar con el proyecto nuevo
+                    scheduler._project = project
+                    scheduler.config = scheduler.get_config(project)
+                    logger.info(f"📅 ProactiveScheduler re-configurado para '{project}'")
+            except Exception as exc:
+                logger.warning(f"⚠️  No se pudo iniciar ProactiveScheduler: {exc}")
+        else:
+            logger.info(f"📅 ProactiveScheduler en espera (proyecto `{project}` en inicialización AI)")
 
         return result
 
-    async def get_architect_patterns(self) -> list:
+    async def create_project(self, name: str, project_type: str = "generic", description: str = "", base_path: Optional[str] = None) -> Dict:
+        """Create a new project and optionally initialize with AI."""
+        result = await self._projects.create_project(name, project_type, description, base_path)
+        
+        if result.get("status") == "ok" and (description or project_type != "generic"):
+            # Persistir estado en DB (sobrevive reinicios)
+            p_name = result["project"]
+            self.context_db.set_project_state(
+                p_name, 'initializing',
+                metadata={'project_type': project_type, 'description': description[:200]}
+            )
+            logger.info(f"➕ [create_project] Proyecto `{p_name}` marcado como 'initializing' en DB.")
+            
+            # Si hay descripción o tipo, pedirle al ejecutor que inicialice el proyecto usando Aider
+            import asyncio
+            asyncio.create_task(self._ai_initialize_project(p_name, result["path"], project_type, description))
+            
+        return result
+
+    async def _ai_initialize_project(self, name: str, path: str, project_type: str, description: str):
+        """Initialize project using AI (Aider)."""
+        from app.dispatcher import send_command, notify
+        from app.models import OrchestratorCommand
+        from app.sockets import emit_agent_event
+        
+        logger.info(f"🚀 AI Initialization for project {name} ({project_type})...")
+        
+        # Emitir evento para el timeline del dashboard
+        await emit_agent_event({
+            "source": "cerebro",
+            "type": "project_init_started",
+            "severity": "info",
+            "payload": {
+                "message": f"Construyendo estructura para `{name}` ({project_type})",
+                "description": description,
+                "path": path
+            }
+        })
+        
+        await notify(f"Inicializando estructura de `{name}` vía Cerebro IA...", level="info", source="cerebro")
+        
+        instruction = (
+            f"Initialize a new {project_type} project named '{name}'. {description}. "
+            f"Create the basic structure and essential files. "
+            f"IMPORTANT: Follow best practices, create a robust .gitignore matching the {project_type} stack, "
+            f"a standard README.md, and ensure the initial code is functional and follows professional architecture."
+        )
+
+        
+        # Intentamos obtener configuración de IA desde el UnifiedConfigManager (Dashboard)
+        from app.config_manager import UnifiedConfigManager
+        config_manager = UnifiedConfigManager.get_instance()
+        unified_config = config_manager.get_config()
+        cerebro_conf = unified_config.cerebro
+        
+        provider = cerebro_conf.auto_fix_provider or "ollama"
+        model = cerebro_conf.auto_fix_model or "qwen3:8b"
+        api_key = cerebro_conf.auto_fix_api_key or ""
+        base_url = cerebro_conf.auto_fix_base_url or ""
+
+        # Log de qué estamos usando
+        logger.info(f"🤖 Utilizando configuración de IA: provider={provider}, model={model}")
+        
+        options = {
+            "instruction": instruction,
+            "workspace_root": path,
+            "provider": provider,
+            "model": model,
+            "api_key": api_key,
+            "base_url": base_url,
+            "require_run": True,
+            "max_build_retries": 5
+        }
+        
+        try:
+            ack = await send_command(
+                "ejecutor",
+                OrchestratorCommand(
+                    action="feature", # 'feature' usa Aider
+                    target="README.md",
+                    options=options
+                )
+            )
+            
+            if ack.get("status") == "accepted":
+                await emit_agent_event({
+                    "source": "cerebro",
+                    "type": "project_init_queued",
+                    "severity": "info",
+                    "payload": {
+                        "message": f"Tarea de construcción encolada en Executor para `{name}`",
+                        "request_id": ack.get("request_id")
+                    }
+                })
+        except Exception as e:
+            logger.error(f"❌ Failed to send AI init command: {e}")
+            await emit_agent_event({
+                "source": "cerebro",
+                "type": "project_init_error",
+                "severity": "error",
+                "payload": {"message": f"Error al iniciar construcción: {str(e)}"}
+            })
+            # Solo remover si falló el envío
+            self.context_db.set_project_state(name, 'error', metadata={'reason': str(e)[:200]})
+
+
+    async def get_architect_patterns(self, project: str = None) -> list:
         """Get available architecture patterns."""
-        return await self._agents.get_architect_suggestions(self._projects.active_project)
+        target = project or self._projects.active_project
+        result = await self._agents.get_architect_suggestions(target)
+        if isinstance(result, dict):
+            return result.get("patterns", [])
+        return result if isinstance(result, list) else []
 
     async def architect_init(self, pattern: str = None) -> Dict:
         """Initialize Architect for active project."""
@@ -407,15 +575,17 @@ class Orchestrator:
             self._projects.active_project, pattern
         )
 
-    async def generate_ai_rules_for_pattern(self, pattern: str) -> Dict:
+    async def generate_ai_rules_for_pattern(self, pattern: str, project: str = None) -> Dict:
         """Generate AI rules for pattern."""
+        target = project or self._projects.active_project
         return await self._agents.generate_ai_rules(
-            self._projects.active_project, pattern
+            target, pattern
         )
 
-    async def get_ai_architecture_suggestions(self) -> Dict:
+    async def get_ai_architecture_suggestions(self, project: str = None) -> Dict:
         """Get AI architecture suggestions."""
-        return await self._agents.get_architect_suggestions(self._projects.active_project)
+        target = project or self._projects.active_project
+        return await self._agents.get_architect_suggestions(target)
 
     # ═══════════════════════════════════════════════════════════════════════
     # WARDEN COMMANDS (delegated to AgentManager)

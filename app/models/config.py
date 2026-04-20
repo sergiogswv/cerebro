@@ -193,6 +193,15 @@ class ProjectOverride(BaseModel):
     )
 
 
+class VoiceConfig(BaseModel):
+    """Configuration for AI voice interaction."""
+    enabled: bool = Field(default=True, description="Enable voice announcements")
+    gender: Literal["male", "female", "neutral"] = Field(default="neutral", description="Voice gender preference")
+    accent: str = Field(default="es-MX", description="Voice accent/language code (e.g., es-MX, es-ES, en-US)")
+    rate: float = Field(default=0.92, ge=0.5, le=2.0, description="Speech rate")
+    pitch: float = Field(default=0.9, ge=0.0, le=2.0, description="Speech pitch")
+
+
 class CerebroConfig(BaseModel):
     """Configuration for the Cerebro orchestrator engine."""
 
@@ -243,6 +252,10 @@ class CerebroConfig(BaseModel):
             "warden": "core"
         },
         description="Mode configuration for each agent (core or adk)"
+    )
+    voice: VoiceConfig = Field(
+        default_factory=VoiceConfig,
+        description="AI voice customization settings"
     )
 
     @field_validator("auto_start_agents")
