@@ -176,14 +176,15 @@ async def get_learning_stats():
 
     db = get_context_db()
     analysis   = db.analyze_learning(limit=200)
+    raw_stats  = db.get_feedback_stats() # Get global totals including orphans
     rules      = db.get_learned_rules(active_only=True) if hasattr(db, "get_learned_rules") else []
     thresholds = orchestrator.decision_engine.get_learned_thresholds()
 
     return ApiResponse(ok=True, data={
         "feedback": {
-            "total":    analysis.get("total_feedback", 0),
-            "positive": analysis.get("positive_feedback_count", 0),
-            "negative": analysis.get("negative_feedback_count", 0),
+            "total":    raw_stats.get("total", 0),
+            "positive": raw_stats.get("thumbs_up", 0),
+            "negative": raw_stats.get("thumbs_down", 0),
         },
         "patterns_analyzed": len(analysis.get("patterns", {})),
         "rule_candidates":   len(analysis.get("rule_adjustments", [])),

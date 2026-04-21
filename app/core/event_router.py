@@ -697,6 +697,7 @@ class EventRouter:
                 "message": f"🧠 Cerebro decidió: {decision.reason} (Acciones: {', '.join([a.value for a in decision.actions]) or 'Ninguna'})",
                 "event_type": event.type,
                 "event_source": event.source,
+                "original_event_id": event.id, # Link feedback to the original event
                 "target_agents": decision.target_agents,
             }
         })
