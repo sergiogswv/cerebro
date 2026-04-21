@@ -18,7 +18,7 @@ Rutas:
 import logging
 import os
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
 from app.models import AgentEvent, ApiResponse, OrchestratorCommand
 from app.orchestrator import orchestrator
 from app.dispatcher import send_command, send_raw_command
@@ -94,23 +94,33 @@ async def get_full_status():
 
 
 @router.post("/events", response_model=ApiResponse, summary="Recibir evento de un agente")
-async def receive_event(event: AgentEvent):
-    """Endpoint principal. Los agentes envían sus eventos aquí."""
-    from fastapi.encoders import jsonable_encoder
+async def receive_event(event: AgentEvent, background_tasks: BackgroundTasks):
+    """
+    Endpoint principal. Los agentes envían sus eventos aquí.
+    Ahora usa BackgroundTasks para evitar bloquear al emisor con procesos pesados
+    como merges de Git o cadenas de análisis de agentes.
+    """
     try:
         logger.info(f"🔔 EVENTO [{event.source}] {event.type}: {event.payload}")
-        print(f"[DEBUG] Evento recibido: source={event.source}, type={event.type}, severity={event.severity}")
-        result = await orchestrator.handle_event(event)
-        # Asegurar seralización de elementos no-JSON (ej. datetime) devueltos en el dict 'result'
-        safe_result = jsonable_encoder(result) 
-        print(f"[DEBUG] Evento procesado: {safe_result}")
-        return ApiResponse(ok=True, message="evento procesado", data=safe_result)
+        
+        # Procesar de forma asíncrona para liberar al emisor inmediatamente
+        async def process_task(ev: AgentEvent):
+            try:
+                await orchestrator.handle_event(ev)
+                logger.debug(f"✅ Evento {ev.id} procesado internamente")
+            except Exception as e:
+                logger.error(f"❌ Error diferido procesando evento {ev.id}: {e}")
+
+        background_tasks.add_task(process_task, event)
+
+        return ApiResponse(
+            ok=True, 
+            message="evento recibido y encolado para procesamiento", 
+            data={"event_id": event.id, "status": "enqueued"}
+        )
     except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        logger.exception("Error procesando evento")
-        print(f"[DEBUG] Error procesando evento: {e}\n{tb}")
-        raise HTTPException(status_code=500, detail=tb)
+        logger.exception("Error recibiendo evento")
+        return ApiResponse(ok=False, message=f"Error recibiendo evento: {str(e)}")
 
 
 @router.post("/bootstrap", response_model=ApiResponse, summary="Iniciar proceso de selección de proyecto")
@@ -197,8 +207,26 @@ async def create_project(request: Request):
 
 @router.post("/command/{agent}", response_model=ApiResponse, summary="Enviar comando a un agente")
 async def dispatch_command(agent: str, request: Request):
-    """Proxy transparente: reenvía el JSON tal cual al agente."""
+    """Proxy transparente con inyección de contexto para el Ejecutor."""
     body = await request.json()
+    
+    # ── 💉 INYECCIÓN DE CONTEXTO PARA EJECUTOR ──
+    # Si manda al ejecutor un autofix/feature/bugfix y no hay ruta, inyectar el active_project
+    if agent == "ejecutor":
+        project_name = orchestrator.active_project
+        if project_name:
+            project_path = orchestrator._projects.get_project_path(project_name)
+            # Solo inyectar si el comando parece de ejecución/escritura y viene vacío de target
+            if "target" not in body or not body["target"]:
+                body["project_path"] = project_path
+                logger.debug(f"💉 Inyectada ruta de proyecto activo: {project_path}")
+        else:
+            # Si no hay proyecto activo, no permitir comandos de escritura al ejecutor
+            action = body.get("action", "")
+            if action in ("autofix", "feature", "bugfix", "run"):
+                logger.warning("⛔ Comando al ejecutor bloqueado: No hay proyecto activo.")
+                return ApiResponse(ok=False, message="Debes seleccionar un proyecto activo antes de enviar tareas de ejecución.")
+
     ack = await send_raw_command(agent, body)
     return ApiResponse(ok=True, message=f"comando enviado a {agent}", data=ack)
 

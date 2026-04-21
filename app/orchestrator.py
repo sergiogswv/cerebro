@@ -174,16 +174,16 @@ class Orchestrator:
     # ═══════════════════════════════════════════════════════════════════════
 
     async def bootstrap(self) -> Dict:
-        """Bootstrap system and restore previous active state."""
+        """Bootstrap system and scan projects. (Automatic restoration disabled per user request)"""
         logger.info("🚀 Starting bootstrap")
         
-        # 1. Recuperar proyecto activo previo
-        active_projects = self.context_db.get_projects_by_state('active')
-        if active_projects:
-            last_active = active_projects[0]
-            logger.info(f"♻️  Restoring last active project: {last_active}")
-            # Gatillar todos los side-effects (Sentinel, etc)
-            await self.set_active_project(last_active)
+        # NOTE: Restoration of previous active state is disabled to ensure 
+        # manual selection on every startup.
+        # active_projects = self.context_db.get_projects_by_state('active')
+        # if active_projects:
+        #     last_active = active_projects[0]
+        #     logger.info(f"♻️  Restoring last active project: {last_active}")
+        #     await self.set_active_project(last_active)
 
         return await self._projects.bootstrap()
 

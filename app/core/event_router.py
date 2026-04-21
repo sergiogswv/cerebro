@@ -127,11 +127,29 @@ class EventRouter:
 
     async def _route_internal(self, event: AgentEvent) -> Dict[str, Any]:
         """
-        Route an event to appropriate handlers.
+        Route an event to appropriate handlers. (Safety-guarded for active projects)
 
         Returns:
             Dict with actions taken
         """
+        # ── 🛡️ GUARDIA DE SEGURIDAD: Requerir Proyecto Activo ──
+        # Para eventos que disparan análisis o ejecución, el proyecto DEBE estar definido.
+        from app.orchestrator import orchestrator
+        active_project = orchestrator.active_project
+        
+        # Lista de eventos que requieren un proyecto seleccionado para operar con seguridad
+        project_required_events = {
+            "file_change", "vulnerability_detected", "bug_detected", 
+            "architectural_violation", "feature_request", "autofix_triggered"
+        }
+        
+        if not active_project and event.type in project_required_events:
+            logger.warning(f"⚠️ Evento '{event.type}' ignorado: No hay un proyecto activo seleccionado.")
+            await notify(
+                f"⚠️ **Acción bloqueada:** Se recibió un evento `{event.type}`, pero no hay ningún proyecto activo. Por favor, selecciona uno en el Dashboard.",
+                level="warning", source="cerebro"
+            )
+            return {"actions": [], "status": "blocked", "reason": "no_active_project"}
         # ── EVENTOS DE EXECUTOR (Control de ciclo de vida de fixes) ──
         if event.source == "executor" and event.type in ("task_completed", "task_failed", "autofix_completed", "autofix_failed", "feature_completed", "feature_failed", "bugfix_completed", "bugfix_failed"):
             file_path = event.payload.get("target") or event.payload.get("file")
@@ -1152,26 +1170,40 @@ class EventRouter:
     async def _dispatch_to_executor(self, event: AgentEvent, task_description: str, file_hint: str | None, task_type: str) -> Dict:
         """
         Envía una tarea seleccionada por Sentinel ADK al Executor para ejecución automática.
+        Ahora con un 'Super Prompt' que incluye contexto explícito para Aider.
         """
         import uuid
         from datetime import datetime, timezone
 
         logger.info(f"🚀 [Cerebro] Enviando tarea a Executor: {task_type}")
+        
+        # --- MEJORA: Construcción del Super Prompt para Aider ---
+        # Si la instrucción viene de Sentinel, le damos formato de reporte de error
+        if event.source == "sentinel":
+            enriched_instruction = (
+                f"🚨 HALLAZGOS CRÍTICOS DE SENTINEL ({task_type.upper()}):\n"
+                f"--------------------------------------------------\n"
+                f"{task_description}\n"
+                f"--------------------------------------------------\n\n"
+                f"TAREA: Como experto en software, corrige INMEDIATAMENTE los problemas listados arriba "
+                f"en el archivo '{file_hint or 'el código fuente'}'.\n"
+                f"Mantén la consistencia con el framework (NestJS/Typescript) y asegura que los tests pasen."
+            )
+            task_description = enriched_instruction
 
         # Determinar acción: 'autofix' usa Aider, 'run' para otras tareas
-        # Incluimos permanentemente maintainability y refactor en autofix
         is_autofix = task_type in ["bugfix", "security", "autofix", "maintainability", "refactor"]
         action = "autofix" if is_autofix else "run"
+        
+        # Log del prompt inyectado (truncado para el log)
+        logger.info(f"💉 Inyectando Super Prompt de {len(task_description)} caracteres...")
 
         # Obtener prioridad desde el evento original si existe
         payload_orig = event.payload or {}
         task_priority = payload_orig.get("task_priority") or payload_orig.get("priority", "medium")
 
         # 1. Ya no pausamos Sentinel Core físicamente (Cerebro ya bloquea el re-análisis via _active_processing)
-        # Esto evita que Sentinel se quede pausado permanentemente si falla la notificación de finalización.
         logger.info("🛡️ [Cerebro] Manteniendo Sentinel Core activo (Lock lógico aplicado en Cerebro)")
-
-        # Construir el comando para Executor (formato compatible con handle_command en executor/app/routes.py)
         from app.config import get_settings
         from app.config_manager import UnifiedConfigManager
         
