@@ -178,7 +178,35 @@ class ProjectManager:
         proj = project or self._active_project
         if not proj:
             return "."
-        return os.path.join(self.workspace_root, proj).replace("\\", "/")
+        
+        # 1. Si el nombre ya es una ruta absoluta existente, usarla
+        if os.path.isabs(proj) and os.path.exists(proj):
+            return proj.replace("\\", "/")
+            
+        # 2. Intentar unir con workspace_root
+        candidate = os.path.join(self.workspace_root, proj).replace("\\", "/")
+        if os.path.exists(candidate):
+            return candidate
+
+        # 3. Búsqueda inteligente en rutas comunes (Pro Feature)
+        home = str(Path.home())
+        common_roots = [
+            os.path.join(home, "Documents", "dev"),
+            os.path.join(home, "dev"),
+            os.path.join(home, "Projects"),
+        ]
+        for root in common_roots:
+            alt_candidate = os.path.join(root, proj).replace("\\", "/")
+            if os.path.exists(alt_candidate):
+                logger.info(f"✨ Proyecto '{proj}' encontrado en ubicación externa: {alt_candidate}")
+                return alt_candidate
+            
+        # 4. Si no existe en root, pero parece absoluto, devolverlo igual 
+        # para que el error sea descriptivo si realmente no existe.
+        if os.path.isabs(proj):
+            return proj.replace("\\", "/")
+            
+        return candidate
 
     def is_valid_project(self, project: str) -> bool:
         """Check if project exists in workspace."""

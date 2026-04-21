@@ -92,19 +92,25 @@ async def get_full_status():
     return ApiResponse(ok=True, message="Health check completo", data=data)
 
 
+
 @router.post("/events", response_model=ApiResponse, summary="Recibir evento de un agente")
 async def receive_event(event: AgentEvent):
     """Endpoint principal. Los agentes envían sus eventos aquí."""
+    from fastapi.encoders import jsonable_encoder
     try:
         logger.info(f"🔔 EVENTO [{event.source}] {event.type}: {event.payload}")
         print(f"[DEBUG] Evento recibido: source={event.source}, type={event.type}, severity={event.severity}")
         result = await orchestrator.handle_event(event)
-        print(f"[DEBUG] Evento procesado: {result}")
-        return ApiResponse(ok=True, message="evento procesado", data=result)
+        # Asegurar seralización de elementos no-JSON (ej. datetime) devueltos en el dict 'result'
+        safe_result = jsonable_encoder(result) 
+        print(f"[DEBUG] Evento procesado: {safe_result}")
+        return ApiResponse(ok=True, message="evento procesado", data=safe_result)
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
         logger.exception("Error procesando evento")
-        print(f"[DEBUG] Error procesando evento: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[DEBUG] Error procesando evento: {e}\n{tb}")
+        raise HTTPException(status_code=500, detail=tb)
 
 
 @router.post("/bootstrap", response_model=ApiResponse, summary="Iniciar proceso de selección de proyecto")
