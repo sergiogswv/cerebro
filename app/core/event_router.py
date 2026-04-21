@@ -99,6 +99,32 @@ class EventRouter:
             for k, ts in self._active_processing.items()
         ]
 
+    def _get_project_root_for_file(self, file_path: str) -> str:
+        """Deduce la raíz del proyecto para un archivo dado."""
+        import os
+        if not file_path or file_path == "unknown":
+            return "default"
+            
+        file_path_norm = file_path.replace("\\", "/").lower()
+        
+        # 1. Verificar si ya es parte de un proyecto bloqueado
+        for locked_root in self._active_processing.keys():
+            if file_path_norm.startswith(locked_root):
+                return locked_root
+                
+        # 2. Heurística básica: buscar package.json, Cargo.toml, .git
+        curr = os.path.dirname(file_path) if os.path.isfile(file_path) else file_path
+        try:
+            for _ in range(5):
+                if any(os.path.exists(os.path.join(curr, f)) for f in ["package.json", "Cargo.toml", ".git", ".sentinelrc.toml"]):
+                    return curr.replace("\\", "/").lower()
+                parent = os.path.dirname(curr)
+                if parent == curr: break
+                curr = parent
+        except: pass
+        
+        return os.path.dirname(file_path).replace("\\", "/").lower()
+
     async def _route_internal(self, event: AgentEvent) -> Dict[str, Any]:
         """
         Route an event to appropriate handlers.
@@ -320,9 +346,16 @@ class EventRouter:
                     }
                 })
 
-                # Reenviar al ADK para análisis
-                adk_result = await self._forward_to_sentinel_adk(event)
-                result["actions"].append(adk_result)
+                # Reenviar al ADK para análisis con bloqueo activo
+                project_root = self._get_project_root_for_file(file_path)
+                self._active_processing[project_root] = time.time()
+                
+                try:
+                    adk_result = await self._forward_to_sentinel_adk(event)
+                    result["actions"].append(adk_result)
+                finally:
+                    # Liberar bloqueo tras análisis
+                    self._active_processing.pop(project_root, None)
 
         # ── EVENTOS DE SENTINEL (ADK o CORE) CON TAREA SELECCIONADA ──
         # Cuando Sentinel analiza y selecciona una tarea (ya sea vía ADK o via Core Rust)
@@ -785,16 +818,24 @@ class EventRouter:
                 # Asegurar que el pipeline tenga el proyecto activo
                 if orchestrator.active_project:
                     orchestrator._pipeline.set_active_project(orchestrator.active_project)
-                pipeline_result = await orchestrator.start_pipeline_analysis(
-                    file_path=file_path,
-                    agents=targets
-                )
-                return {
-                    "action": "pipeline_started",
-                    "file": file_path,
-                    "agents": targets,
-                    "pipeline_result": pipeline_result
-                }
+                
+                # Bloqueo mientras corre el pipeline
+                project_root = self._get_project_root_for_file(file_path)
+                self._active_processing[project_root] = time.time()
+                
+                try:
+                    pipeline_result = await orchestrator.start_pipeline_analysis(
+                        file_path=file_path,
+                        agents=targets
+                    )
+                    return {
+                        "action": "pipeline_started",
+                        "file": file_path,
+                        "agents": targets,
+                        "pipeline_result": pipeline_result
+                    }
+                finally:
+                    self._active_processing.pop(project_root, None)
             except Exception as e:
                 logger.error(f"Error iniciando pipeline: {e}")
                 return {"action": "pipeline_error", "error": str(e)}
