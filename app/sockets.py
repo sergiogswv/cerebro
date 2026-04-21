@@ -73,9 +73,12 @@ async def emit_agent_event(event_data: dict):
         event_source = event_data.get('source', 'unknown')
         print(f"[SOCKET DEBUG] emit_agent_event llamado: source={event_source}, type={event_type}, id={event_data.get('id')}")
 
+        from fastapi.encoders import jsonable_encoder
+        
         # Validate event against schema
         validated = validate_event(event_data)
-        event_with_metadata = validated.model_dump()
+        # Asegurar serialización (ej. datetime) antes de emitir
+        event_with_metadata = jsonable_encoder(validated.model_dump())
         print(f"[SOCKET DEBUG] Evento validado correctamente")
 
         # Guardar estado de readiness de los agentes
@@ -94,13 +97,14 @@ async def emit_agent_event(event_data: dict):
         print(f"[SOCKET DEBUG] Emitiendo evento por Socket.IO...")
         await sio.emit('agent_event', event_with_metadata)
         print(f"[SOCKET DEBUG] ✅ Evento emitido exitosamente: {event_type}")
-        logger.debug(f"📤 Evento emitido por Socket.IO: {event_data.get('type')}")
 
     except EventValidationError as e:
+        from fastapi.encoders import jsonable_encoder
         logger.warning(f"⚠️ Evento con schema inválido: {e}")
         print(f"[SOCKET DEBUG] ⚠️ Schema inválido, emitiendo de todos modos: {e}")
-        # Still emit but log the issue
-        await sio.emit('agent_event', event_data)
+        # Still emit but log the issue and ensure serialization
+        safe_event_data = jsonable_encoder(event_data)
+        await sio.emit('agent_event', safe_event_data)
         print(f"[SOCKET DEBUG] ✅ Evento emitido (con warning de schema)")
     except Exception as e:
         logger.error(f"❌ Error emitiendo por Socket.IO: {e}")
