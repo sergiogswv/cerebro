@@ -358,7 +358,13 @@ class DecisionEngine:
             except Exception as _ae:
                 logger.debug(f"No se pudo evaluar autofix: {_ae}")
 
-        logger.info(f"✅ Decisión: actions={[a.value for a in decision.actions]}, "
+        # 12. Punto de Inflexión de Calidad (TASK: Refined)
+        # Aunque Sentinel apruebe, permitimos que el flujo continúe hacia Architect
+        # para validar integridad estructural. La optimización ahora ocurre DENTRO de Architect.
+        if (source == "sentinel" or "sentinel" in source) and payload.get("status") == "approved":
+             logger.info(f"✨ [Quality Check] Sentinel aprobó el código. Continuando hacia {decision.target_agents} para validación estructural...")
+
+        logger.info(f"✅ Decisión FINAL: actions={[a.value for a in decision.actions]}, "
                     f"targets={decision.target_agents}, confidence={decision.confidence:.2f}")
 
         return decision
